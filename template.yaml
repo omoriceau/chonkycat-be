@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ChonkyChonk Backend
+
+# ============================================================
+# Global defaults applied to every Lambda unless overridden
+# ============================================================
+Globals:
+  Function:
+    Runtime:       python3.13
+    MemorySize:    256
+    Timeout:       30
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        DB_CLUSTER_ARN: !Ref DBClusterArn
+        DB_SECRET_ARN:  !Ref DBSecretArn
+        DB_NAME:        !Ref DBName
+        EVENT_BUS_NAME: !Ref EventBusName
+        DB_HOST: !Sub "${DBHost}"
+        DB_PORT: !Sub "${DBPort}"
+        DB_USER: !Sub "${DBUser}"
+        DB_PASSWORD: !Sub "${DBPassword}"
+
+# ============================================================
+# Parameters — set per environment via samconfig.toml
+# ============================================================
+Parameters:
+  Environment:
+    Type:    String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  DBClusterArn:
+    Type:        String
+    Description: Aurora Serverless cluster ARN
+
+  DBSecretArn:
+    Type:        String
+    Description: Secrets Manager ARN for DB credentials
+
+  DBName:
+    Type:    String
+    Default: chonkychonk
+
+  DBHost:
+    Type:    String
+    Default: localhost
+    Description: Database host (localhost for local dev, RDS endpoint for AWS)
+
+  DBPort:
+    Type:    String
+    Default: "33306"
+    Description: Database port
+
+  DBUser:
+    Type:    String
+    Default: chonky_user
+    Description: Database user
+
+  DBPassword:
+    Type:    String
+    Default: chonky_password
+    NoEcho:  true
+    Description: Database password
+
+  EventBusName:
+    Type:    String
+    Default: chonkychonk-bus
+
+  StripeSecretKey:
+    Type:        String
+    NoEcho:      true
+    Description: Stripe secret key (live or test)
+
+  EmailFromAddress:
+    Type:        String
+    Description: Verified SES sender address
+
+  EmailFromName:
+    Type:    String
+    Default: ChonkyChonk
+
+  SupportEmail:
+    Type:        String
+    Description: Support email shown in customer-facing emails
+
+  LowStockRecipient:
+    Type:        String
+    Description: Internal email for low stock alerts
+
+  CognitoEnabled:
+    Type:    String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  CognitoUserPoolId:
+    Type:    String
+    Default: ""
+
+  CognitoAppClientId:
+    Type:    String
+    Default: ""
+
+  ApigwWsEndpoint:
+    Type:        String
+    Default:     ""
+    Description: API Gateway WebSocket management endpoint
+
+  SnsOpsTopicArn:
+    Type:        String
+    Default:     ""
+    Description: SNS topic ARN for ops alerts
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # EventBridge bus
+  # ----------------------------------------------------------
+  ChonkyEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref EventBusName
+
+  # ----------------------------------------------------------
+  # SNS ops alert topic
+  # ----------------------------------------------------------
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: chonkychonk-ops-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref LowStockRecipient
+
+  # ----------------------------------------------------------
+  # Shared IAM policy — RDS Data API + Secrets Manager
+  # Attached to every Lambda that needs DB access
+  # ----------------------------------------------------------
+  DBAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub chonkychonk-db-access-${Environment}
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - rds-data:ExecuteStatement
+              - rds-data:BatchExecuteStatement
+              - rds-data:BeginTransaction
+              - rds-data:CommitTransaction
+              - rds-data:RollbackTransaction
+            Resource: !Ref DBClusterArn
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref DBSecretArn
+
+  # ----------------------------------------------------------
+  # Products Lambda  —  GET /products
+  # ----------------------------------------------------------
+  ProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-products-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.products.lambda_handler.lambda_handler
+      Description:  GET /products
+      Policies:
+        - !Ref DBAccessPolicy
+      Events:
+        GetProducts:
+          Type: Api
+          Properties:
+            Path:   /products
+            Method: GET
+
+  # ----------------------------------------------------------
+  # Users Lambda  —  GET /users/{id}
+  # ----------------------------------------------------------
+  UsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-users-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.users.lambda_handler.lambda_handler
+      Description:  GET /users/{id}
+      Environment:
+        Variables:
+          COGNITO_ENABLED:       !Ref CognitoEnabled
+          COGNITO_USER_POOL_ID:  !Ref CognitoUserPoolId
+          COGNITO_APP_CLIENT_ID: !Ref CognitoAppClientId
+      Policies:
+        - !Ref DBAccessPolicy
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
+      Events:
+        GetUser:
+          Type: Api
+          Properties:
+            Path:   /users/{id}
+            Method: GET
+
+  # ----------------------------------------------------------
+  # Orders Lambda  —  POST /orders
+  # CodeUri points at root so the shared/ module is accessible
+  # ----------------------------------------------------------
+  OrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-orders-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.orders.lambda_handler.lambda_handler
+      Description:  POST /orders
+      Policies:
+        - !Ref DBAccessPolicy
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            Path:   /orders
+            Method: POST
+
+  # ----------------------------------------------------------
+  # Payments Lambda  —  EventBridge target (OrderCreated)
+  # ----------------------------------------------------------
+  PaymentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-payments-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.payments.lambda_handler.lambda_handler
+      Description:  Processes charges and refunds
+      Timeout:      30
+      Environment:
+        Variables:
+          PAYMENT_PROVIDER:  stripe
+          STRIPE_SECRET_KEY: !Ref StripeSecretKey
+          APIGW_WS_ENDPOINT: !Ref ApigwWsEndpoint
+          SNS_OPS_TOPIC_ARN: !Ref SnsOpsTopicArn
+      Policies:
+        - !Ref DBAccessPolicy
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OpsAlertTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: "*"
+      Events:
+        OnOrderCreated:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.orders"]
+              detail-type: ["OrderCreated"]
+
+  # ----------------------------------------------------------
+  # Email Lambda  —  EventBridge target (all email events)
+  # ----------------------------------------------------------
+  EmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-email-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.mailer.lambda_handler.lambda_handler
+      Description:  Sends all transactional and ops emails via SES
+      Environment:
+        Variables:
+          EMAIL_PROVIDER:      ses
+          EMAIL_FROM_ADDRESS:  !Ref EmailFromAddress
+          EMAIL_FROM_NAME:     !Ref EmailFromName
+          SUPPORT_EMAIL:       !Ref SupportEmail
+          LOW_STOCK_RECIPIENT: !Ref LowStockRecipient
+      Policies:
+        - SESCrudPolicy:
+            IdentityName: !Ref EmailFromAddress
+      Events:
+        OnPaymentSettled:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.payments"]
+              detail-type: ["PaymentSettled"]
+        OnPaymentFailed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.payments"]
+              detail-type: ["PaymentFailed"]
+        OnRefundComplete:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.payments"]
+              detail-type: ["RefundComplete"]
+        OnLowStock:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.orders"]
+              detail-type: ["LowStockDetected"]
+        OnUserRegistered:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.users"]
+              detail-type: ["UserRegistered"]
+        OnPasswordReset:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.users"]
+              detail-type: ["PasswordResetRequest"]
+        OnOrderSummary:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:      ["chonkychonk.users"]
+              detail-type: ["OrderSummaryRequest"]
+
+  # ----------------------------------------------------------
+  # WebSocket Lambda  —  $connect / $disconnect / notify
+  # ----------------------------------------------------------
+  WebSocketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-websocket-${Environment}
+      CodeUri:      .
+      Handler:      lambdas.websocket.lambda_handler.lambda_handler
+      Description:  API Gateway WebSocket handler (stateless — no DB required)
+      # No DBAccessPolicy needed: connection_id is threaded through the order
+      # flow rather than persisted in a ws_connections table. The browser passes
+      # its connection_id in the POST /orders body; PaymentsFunction pushes the
+      # result back directly using post_to_connection.
+
+# ============================================================
+# Outputs — printed after every deploy, useful for wiring
+# up WebSocket endpoint, Cognito, and frontend config
+# ============================================================
+Outputs:
+  ProductsApi:
+    Description: Products endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/products"
+
+  OrdersApi:
+    Description: Orders endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+
+  UsersApi:
+    Description: Users endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/users/{id}"
+
+  EventBusArn:
+    Description: EventBridge bus ARN
+    Value: !GetAtt ChonkyEventBus.Arn
+
+  OpsTopicArn:
+    Description: SNS ops alert topic ARN
+    Value: !Ref OpsAlertTopic

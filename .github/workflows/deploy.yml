@@ -1,0 +1,116 @@
+name: Deploy ChonkyChonk Backend
+
+on:
+  push:
+    branches: [main]       # deploys to dev on every push
+    tags:     ['v*']       # deploys to prod on version tags (e.g. v1.0.0)
+  pull_request:
+    branches: [main]       # build + validate only, no deploy
+
+permissions:
+  id-token: write          # required for OIDC auth to AWS (no long-lived keys stored)
+  contents: read
+
+jobs:
+
+  # ============================================================
+  # Build and validate on every PR — catches errors before merge
+  # ============================================================
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/setup-sam@v2
+
+      - name: SAM build
+        run: sam build --config-env dev
+
+      - name: SAM validate
+        run: sam validate --lint
+
+  # ============================================================
+  # Deploy to dev on every push to main
+  # ============================================================
+  deploy-dev:
+    name: Deploy → Dev
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/setup-sam@v2
+
+      # Authenticate via OIDC — no AWS access keys stored in GitHub secrets
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region:     ca-central-1
+
+      - name: SAM build
+        run: sam build --config-env dev
+
+      - name: SAM deploy → dev
+        env:
+          DB_CLUSTER_ARN:      ${{ secrets.DB_CLUSTER_ARN }}
+          DB_SECRET_ARN:       ${{ secrets.DB_SECRET_ARN }}
+          STRIPE_SECRET_KEY:   ${{ secrets.STRIPE_SECRET_KEY }}
+          EMAIL_FROM_ADDRESS:  ${{ secrets.EMAIL_FROM_ADDRESS }}
+          SUPPORT_EMAIL:       ${{ secrets.SUPPORT_EMAIL }}
+          LOW_STOCK_RECIPIENT: ${{ secrets.LOW_STOCK_RECIPIENT }}
+          APIGW_WS_ENDPOINT:   ${{ secrets.APIGW_WS_ENDPOINT }}
+          SNS_OPS_TOPIC_ARN:   ${{ secrets.SNS_OPS_TOPIC_ARN }}
+        run: sam deploy --config-env dev --no-confirm-changeset
+
+  # ============================================================
+  # Deploy to prod on a version tag (v1.0.0, v2.1.3, etc.)
+  # ============================================================
+  deploy-prod:
+    name: Deploy → Prod
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: prod      # add a manual approval gate in GitHub environments if desired
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/setup-sam@v2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region:     ca-central-1
+
+      - name: SAM build
+        run: sam build --config-env prod
+
+      - name: SAM deploy → prod
+        env:
+          DB_CLUSTER_ARN:        ${{ secrets.DB_CLUSTER_ARN_PROD }}
+          DB_SECRET_ARN:         ${{ secrets.DB_SECRET_ARN_PROD }}
+          STRIPE_SECRET_KEY:     ${{ secrets.STRIPE_SECRET_KEY_PROD }}
+          EMAIL_FROM_ADDRESS:    ${{ secrets.EMAIL_FROM_ADDRESS }}
+          SUPPORT_EMAIL:         ${{ secrets.SUPPORT_EMAIL }}
+          LOW_STOCK_RECIPIENT:   ${{ secrets.LOW_STOCK_RECIPIENT }}
+          APIGW_WS_ENDPOINT:     ${{ secrets.APIGW_WS_ENDPOINT_PROD }}
+          SNS_OPS_TOPIC_ARN:     ${{ secrets.SNS_OPS_TOPIC_ARN_PROD }}
+          COGNITO_USER_POOL_ID:  ${{ secrets.COGNITO_USER_POOL_ID }}
+          COGNITO_APP_CLIENT_ID: ${{ secrets.COGNITO_APP_CLIENT_ID }}
+        run: sam deploy --config-env prod
