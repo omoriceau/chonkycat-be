@@ -119,7 +119,7 @@ def lambda_handler(event: dict, context) -> dict:
 
     if not show_all:
         conditions.append(f"p.active = ${param_index}")
-        sql_params.append({"name": "active", "value": {"longValue": 1}})
+        sql_params.append({"name": "active", "value": {"booleanValue": True}})
         param_index += 1
 
     if category:

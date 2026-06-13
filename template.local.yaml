@@ -15,9 +15,9 @@ Globals:
       Variables:
         DB_HOST:         chonkychonk-db
         DB_PORT:         "5432"
-        DB_USER:         chonky_admin
-        DB_PASSWORD:     Ch0nky_Secure_P4ss_2026!
-        DB_NAME:         chonky
+        DB_USER:         chonky_user
+        DB_PASSWORD:     chonky_password
+        DB_NAME:         chonkychonk
         EVENT_BUS_NAME:  chonkychonk-bus
 
 # ============================================================
