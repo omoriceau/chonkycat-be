@@ -29,6 +29,12 @@ DB_INSTANCES=$(aws rds describe-db-instances \
   --output text)
 
 for DB in $DB_INSTANCES; do
+  # Skip database-1-instance-1
+  if [[ "$DB" == "database-1-instance-1" ]]; then
+    echo "Skipping DB instance: $DB"
+    continue
+  fi
+
   echo "Deleting DB instance: $DB"
 
   aws rds delete-db-instance \
@@ -37,7 +43,7 @@ for DB in $DB_INSTANCES; do
     || true
 done
 
-# 2. Wait for instances to go away (important for clusters)
+# 2. Wait for instances to go away (important for clusters), excluding database-1-instance-1
 echo "Waiting for DB instances to delete... checking every 1 minute"
 
 while true; do
@@ -45,8 +51,11 @@ while true; do
     --query 'DBInstances[].DBInstanceIdentifier' \
     --output text 2>/dev/null || true)
 
+  # Filter out database-1-instance-1
+  DB_INSTANCES=$(echo "$DB_INSTANCES" | tr ' ' '\n' | grep -v "^database-1-instance-1$" | tr '\n' ' ' | xargs || true)
+
   if [[ -z "$DB_INSTANCES" ]]; then
-    echo "No DB instances remaining"
+    echo "No DB instances remaining (database-1-instance-1 excluded)"
     break
   fi
 

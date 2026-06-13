@@ -14,12 +14,10 @@ Globals:
     Environment:
       Variables:
         DB_HOST:         chonkychonk-db
-        DB_PORT:         "3306"
-        DB_USER:         chonky_user
-        DB_PASSWORD:     chonky_password
-        DB_NAME:         chonkychonk
-        DB_CLUSTER_ARN:  "arn:aws:rds:ca-central-1:000000000000:cluster/chonky-cluster"
-        DB_SECRET_ARN:   "arn:aws:secretsmanager:ca-central-1:000000000000:secret/chonky-secret"
+        DB_PORT:         "5432"
+        DB_USER:         chonky_admin
+        DB_PASSWORD:     Ch0nky_Secure_P4ss_2026!
+        DB_NAME:         chonky
         EVENT_BUS_NAME:  chonkychonk-bus
 
 # ============================================================

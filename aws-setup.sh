@@ -10,12 +10,11 @@ SUBNET_A_CIDR="10.0.1.0/24"
 SUBNET_B_CIDR="10.0.2.0/24"
 SUBNET_GROUP_NAME="chonky-subnet-group"
 SG_NAME="chonky-db-sg"
-CLUSTER_ID="chonky-cluster"
 INSTANCE_ID="chonky-instance"
 DB_NAME="chonky"
-DB_USER="admin"
+DB_USER="chonky_admin"
 DB_PASS="Ch0nky_Secure_P4ss_2026!"
-ENGINE_VERSION="17.1"
+ENGINE_VERSION="18.3"
 
 # ==============================================================================
 # HELPERS
@@ -46,7 +45,6 @@ else
     log "VPC already exists: $VPC_ID — skipping creation."
 fi
 
-# Verify the VPC CIDR matches what we expect (catches partial/conflicting state)
 ACTUAL_CIDR=$(aws ec2 describe-vpcs \
     --vpc-ids "$VPC_ID" \
     --query 'Vpcs[0].CidrBlock' \
@@ -116,7 +114,6 @@ fi
 
 # ==============================================================================
 # 4. RDS SUBNET GROUP
-# Explicitly validates it belongs to our VPC — no silent wrong-VPC surprises.
 # ==============================================================================
 log "Checking for existing RDS subnet group '$SUBNET_GROUP_NAME'..."
 
@@ -129,7 +126,7 @@ if [ "$EXISTING_SUBNET_GROUP_VPC" = "NOT_FOUND" ]; then
     log "Subnet group not found — creating..."
     aws rds create-db-subnet-group \
         --db-subnet-group-name "$SUBNET_GROUP_NAME" \
-        --db-subnet-group-description "Subnet group for chonky serverless database" \
+        --db-subnet-group-description "Subnet group for chonky database" \
         --subnet-ids "$SUBNET_A_ID" "$SUBNET_B_ID"
     log "Created subnet group: $SUBNET_GROUP_NAME"
 elif [ "$EXISTING_SUBNET_GROUP_VPC" = "$VPC_ID" ]; then
@@ -139,121 +136,32 @@ else
 fi
 
 # ==============================================================================
-# 5. SECURITY GROUPS (DB + LAMBDA)
+# 5. SECURITY GROUP
 # ==============================================================================
+log "Checking for existing security group '$SG_NAME' in VPC $VPC_ID..."
 
-log "Checking for existing security groups in VPC $VPC_ID..."
-
-DB_SG_NAME="${SG_NAME}-db"
-LAMBDA_SG_NAME="${SG_NAME}-lambda"
-
-# ------------------------------------------------------------------------------
-# DB SECURITY GROUP
-# ------------------------------------------------------------------------------
-log "Checking for DB security group '$DB_SG_NAME'..."
-
-DB_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
+SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
     --filters \
-        "Name=group-name,Values=$DB_SG_NAME" \
+        "Name=group-name,Values=$SG_NAME" \
         "Name=vpc-id,Values=$VPC_ID" \
     --query 'SecurityGroups[0].GroupId' \
     --output text)
 
-if [ "$DB_SECURITY_GROUP_ID" = "None" ] || [ -z "$DB_SECURITY_GROUP_ID" ]; then
-    log "DB security group not found — creating..."
-    DB_SECURITY_GROUP_ID=$(aws ec2 create-security-group \
-        --group-name "$DB_SG_NAME" \
-        --description "Security group for Postgres DB" \
+if [ "$SECURITY_GROUP_ID" = "None" ] || [ -z "$SECURITY_GROUP_ID" ]; then
+    log "Security group not found — creating..."
+    SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+        --group-name "$SG_NAME" \
+        --description "Firewall for chonky database" \
         --vpc-id "$VPC_ID" \
         --query 'GroupId' \
         --output text)
-    log "Created DB security group: $DB_SECURITY_GROUP_ID"
+    log "Created security group: $SECURITY_GROUP_ID"
 else
-    log "DB security group already exists: $DB_SECURITY_GROUP_ID"
-fi
-
-# Allow Postgres inbound ONLY from Lambda SG (added later if missing)
-log "Ensuring DB allows inbound PostgreSQL from Lambda SG..."
-
-# ------------------------------------------------------------------------------
-# LAMBDA SECURITY GROUP
-# ------------------------------------------------------------------------------
-log "Checking for Lambda security group '$LAMBDA_SG_NAME'..."
-
-LAMBDA_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
-    --filters \
-        "Name=group-name,Values=$LAMBDA_SG_NAME" \
-        "Name=vpc-id,Values=$VPC_ID" \
-    --query 'SecurityGroups[0].GroupId' \
-    --output text)
-
-if [ "$LAMBDA_SECURITY_GROUP_ID" = "None" ] || [ -z "$LAMBDA_SECURITY_GROUP_ID" ]; then
-    log "Lambda security group not found — creating..."
-    LAMBDA_SECURITY_GROUP_ID=$(aws ec2 create-security-group \
-        --group-name "$LAMBDA_SG_NAME" \
-        --description "Security group for Lambda functions" \
-        --vpc-id "$VPC_ID" \
-        --query 'GroupId' \
-        --output text)
-    log "Created Lambda security group: $LAMBDA_SECURITY_GROUP_ID"
-else
-    log "Lambda security group already exists: $LAMBDA_SECURITY_GROUP_ID"
-fi
-
-# ------------------------------------------------------------------------------
-# RULES
-# ------------------------------------------------------------------------------
-
-# DB: allow Postgres from Lambda SG
-log "Adding DB inbound rule for PostgreSQL (5432) from Lambda SG..."
-
-aws ec2 authorize-security-group-ingress \
-    --group-id "$DB_SECURITY_GROUP_ID" \
-    --protocol tcp \
-    --port 5432 \
-    --source-group "$LAMBDA_SECURITY_GROUP_ID" \
-    2>/dev/null || log "DB ingress rule already exists (skipping)"
-
-# Lambda: allow all outbound (default usually already allows this)
-log "Security groups configured:"
-log "DB SG: $DB_SECURITY_GROUP_ID"
-log "Lambda SG: $LAMBDA_SECURITY_GROUP_ID"
-
-# ==============================================================================
-# 6. AURORA CLUSTER
-# ==============================================================================
-log "Checking for existing DB cluster '$CLUSTER_ID'..."
-
-CLUSTER_STATUS=$(aws rds describe-db-clusters \
-    --db-cluster-identifier "$CLUSTER_ID" \
-    --query 'DBClusters[0].Status' \
-    --output text 2>/dev/null || echo "NOT_FOUND")
-
-if [ "$CLUSTER_STATUS" = "NOT_FOUND" ]; then
-    log "Cluster not found — creating..."
-    aws rds create-db-cluster \
-        --db-cluster-identifier "$CLUSTER_ID" \
-        --engine aurora-postgresql \
-        --engine-version "$ENGINE_VERSION" \
-        --database-name "$DB_NAME" \
-        --master-username "$DB_USER" \
-        --master-user-password "$DB_PASS" \
-        --network-type IPV4 \
-        --db-subnet-group-name "$SUBNET_GROUP_NAME" \
-        --vpc-security-group-ids "$SECURITY_GROUP_ID" \
-        --backup-retention-period 1 \
-        --no-enable-performance-insights \
-        --serverless-v2-scaling-configuration MinCapacity=0.0,MaxCapacity=1.0 \
-        --storage-type aurora-iopt1
-    log "Cluster creation initiated. Waiting for it to become available..."
-    aws rds wait db-cluster-available --db-cluster-identifier "$CLUSTER_ID"
-    log "Cluster is available."
-else
-    log "Cluster '$CLUSTER_ID' already exists (status: $CLUSTER_STATUS) — skipping creation."
+    log "Security group already exists: $SECURITY_GROUP_ID — skipping creation."
 fi
 
 # ==============================================================================
-# 7. AURORA INSTANCE
+# 6. RDS INSTANCE
 # ==============================================================================
 log "Checking for existing DB instance '$INSTANCE_ID'..."
 
@@ -266,11 +174,20 @@ if [ "$INSTANCE_STATUS" = "NOT_FOUND" ]; then
     log "Instance not found — creating..."
     aws rds create-db-instance \
         --db-instance-identifier "$INSTANCE_ID" \
-        --db-cluster-identifier "$CLUSTER_ID" \
-        --engine aurora-mysql \
-        --db-instance-class db.serverless \
+        --db-instance-class db.t4g.micro \
+        --engine postgres \
+        --engine-version "$ENGINE_VERSION" \
+        --db-name "$DB_NAME" \
+        --master-username "$DB_USER" \
+        --master-user-password "$DB_PASS" \
+        --db-subnet-group-name "$SUBNET_GROUP_NAME" \
+        --vpc-security-group-ids "$SECURITY_GROUP_ID" \
+        --backup-retention-period 0 \
+        --no-multi-az \
         --no-publicly-accessible \
-        --no-auto-minor-version-upgrade
+        --no-auto-minor-version-upgrade \
+        --allocated-storage 20 \
+        --storage-type gp2
     log "Instance creation initiated. Waiting for it to become available..."
     aws rds wait db-instance-available --db-instance-identifier "$INSTANCE_ID"
     log "Instance is available."
@@ -279,23 +196,15 @@ else
 fi
 
 # ==============================================================================
-# 8. OUTPUT USEFUL ARNS
+# 7. OUTPUT
 # ==============================================================================
 log "====== DONE ======"
 
-CLUSTER_ARN=$(aws rds describe-db-clusters \
-    --db-cluster-identifier "$CLUSTER_ID" \
-    --query 'DBClusters[0].DBClusterArn' \
+ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier "$INSTANCE_ID" \
+    --query 'DBInstances[0].Endpoint.Address' \
     --output text)
-log "Cluster ARN:  $CLUSTER_ARN"
-
-CLUSTER_ENDPOINT=$(aws rds describe-db-clusters \
-    --db-cluster-identifier "$CLUSTER_ID" \
-    --query 'DBClusters[0].Endpoint' \
-    --output text)
-log "Endpoint:     $CLUSTER_ENDPOINT"
-
-SECRET_ARN=$(aws secretsmanager list-secrets \
-    --query 'SecretList[?contains(Name, `rds`)].ARN' \
-    --output text)
-[ -n "$SECRET_ARN" ] && log "Secret ARN:   $SECRET_ARN" || warn "No RDS secret found in Secrets Manager."
+log "Endpoint: $ENDPOINT"
+log "Port:     5432"
+log "DB Name:  $DB_NAME"
+log "User:     $DB_USER"

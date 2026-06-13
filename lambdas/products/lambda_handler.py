@@ -8,23 +8,19 @@ Query Parameters:
   - low_stock   (bool, default false) — only return low-stock items
 
 Environment Variables:
-  - DB_CLUSTER_ARN   Aurora cluster ARN
-  - DB_SECRET_ARN    Secrets Manager secret ARN (DB credentials)
-  - DB_NAME          Database name (chonkychonk)
+  - DB_HOST      PostgreSQL host
+  - DB_PORT      PostgreSQL port (default 5432)
+  - DB_USER      Database user
+  - DB_PASSWORD  Database password
+  - DB_NAME      Database name
 """
 
 import json
 import os
-from botocore.exceptions import ClientError
+import traceback
 
-# Import DB helper (uses local MySQL or RDS based on environment)
-from shared.db import get_db_client
-
-rds = get_db_client()
-
-DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
-DB_SECRET_ARN  = os.environ["DB_SECRET_ARN"]
-DB_NAME        = os.environ["DB_NAME"]
+# Import DB helper (uses PostgreSQL)
+from db import get_db_client
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE     = 1000
@@ -75,7 +71,6 @@ def rows_to_dicts(column_metadata: list, records: list) -> list[dict]:
     for record in records:
         row = {}
         for col, field in zip(columns, record):
-            # Each field is a dict with one key indicating the type
             value = next(iter(field.values())) if field != {"isNull": True} else None
             row[col] = value
         result.append(row)
@@ -87,7 +82,20 @@ def rows_to_dicts(column_metadata: list, records: list) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def lambda_handler(event: dict, context) -> dict:
+    print(f"[DEBUG] event: {json.dumps(event, default=str)}")
+    print(f"[DEBUG] env: DB_HOST={os.environ.get('DB_HOST')} DB_PORT={os.environ.get('DB_PORT')} DB_NAME={os.environ.get('DB_NAME')} DB_USER={os.environ.get('DB_USER')} DB_PASSWORD={'***' if os.environ.get('DB_PASSWORD') else 'NOT SET'}")
+
+    # -- DB client -----------------------------------------------------------
+    try:
+        db = get_db_client()
+        print(f"[DEBUG] db client created: {type(db)}")
+    except Exception as e:
+        print(f"[ERROR] Failed to create DB client: {e}")
+        print(traceback.format_exc())
+        return err("Failed to initialise database client", status=500)
+
     params = event.get("queryStringParameters") or {}
+    print(f"[DEBUG] query params: {params}")
 
     # -- Parse query params --------------------------------------------------
     show_all  = parse_bool(params.get("show_all"),  default=False)
@@ -102,28 +110,34 @@ def lambda_handler(event: dict, context) -> dict:
     category  = params.get("category", "").strip() or None
 
     offset = (page - 1) * page_size
+    print(f"[DEBUG] parsed: show_all={show_all} low_stock={low_stock} page={page} page_size={page_size} category={category} offset={offset}")
 
     # -- Build WHERE clauses & parameter list --------------------------------
     conditions   = []
     sql_params   = []
+    param_index  = 1
 
     if not show_all:
-        conditions.append("p.active = :active")
+        conditions.append(f"p.active = ${param_index}")
         sql_params.append({"name": "active", "value": {"longValue": 1}})
+        param_index += 1
 
     if category:
-        conditions.append("p.category = :category")
+        conditions.append(f"p.category = ${param_index}")
         sql_params.append({"name": "category", "value": {"stringValue": category}})
+        param_index += 1
 
     if low_stock:
         conditions.append("p.qty <= p.low_stock_threshold")
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    # -- Count query (for pagination metadata) --------------------------------
+    # -- Count query ---------------------------------------------------------
     count_sql = f"SELECT COUNT(*) AS total FROM products p {where_clause}"
+    print(f"[DEBUG] count_sql: {count_sql}")
+    print(f"[DEBUG] sql_params: {sql_params}")
 
-    # -- Data query -----------------------------------------------------------
+    # -- Data query ----------------------------------------------------------
     data_sql = f"""
         SELECT
             p.id,
@@ -142,42 +156,62 @@ def lambda_handler(event: dict, context) -> dict:
         FROM products p
         {where_clause}
         ORDER BY p.category ASC, p.name ASC
-        LIMIT  :limit
-        OFFSET :offset
+        LIMIT ${param_index}
+        OFFSET ${param_index + 1}
     """
+    print(f"[DEBUG] data_sql: {data_sql}")
 
-    # Pagination params are appended after the shared filter params
     paginated_params = sql_params + [
         {"name": "limit",  "value": {"longValue": page_size}},
         {"name": "offset", "value": {"longValue": offset}},
     ]
 
-    # -- Execute --------------------------------------------------------------
+    # -- Execute -------------------------------------------------------------
     try:
-        count_resp = rds.execute_statement(
-            resourceArn=DB_CLUSTER_ARN,
-            secretArn=DB_SECRET_ARN,
-            database=DB_NAME,
+        print("[DEBUG] executing count query...")
+        count_resp = db.execute_statement(
             sql=count_sql,
             parameters=sql_params,
         )
+        print(f"[DEBUG] count_resp: {count_resp}")
+        
+        if not count_resp.get("records"):
+            print("[ERROR] Count query returned no records")
+            return err("Failed to retrieve product count from database", status=500)
+        
         total_items = count_resp["records"][0][0]["longValue"]
 
-        data_resp = rds.execute_statement(
-            resourceArn=DB_CLUSTER_ARN,
-            secretArn=DB_SECRET_ARN,
-            database=DB_NAME,
+        print("[DEBUG] executing data query...")
+        data_resp = db.execute_statement(
             sql=data_sql,
             parameters=paginated_params,
             includeResultMetadata=True,
         )
+        print(f"[DEBUG] data_resp record count: {len(data_resp.get('records', []))}")
+        
+        if "columnMetadata" not in data_resp:
+            print("[ERROR] Data query response missing columnMetadata")
+            return err("Database query response format error: missing column metadata", status=500)
 
-    except ClientError as e:
-        print(f"RDS Data API error: {e}")
-        return err("Database error", status=500)
+    except ConnectionError as e:
+        print(f"[ERROR] Database connection error: {e}")
+        print(traceback.format_exc())
+        return err(f"Database connection failed: {str(e)}", status=503)
+    except ValueError as e:
+        print(f"[ERROR] Database response parsing error: {e}")
+        print(traceback.format_exc())
+        return err(f"Failed to parse database response: {str(e)}", status=500)
+    except KeyError as e:
+        print(f"[ERROR] Missing expected field in database response: {e}")
+        print(traceback.format_exc())
+        return err(f"Database response missing expected field: {str(e)}", status=500)
+    except Exception as e:
+        print(f"[ERROR] Unexpected database error: {e}")
+        print(traceback.format_exc())
+        return err(f"Database query failed: {str(e)}", status=500)
 
     products = rows_to_dicts(data_resp["columnMetadata"], data_resp["records"])
-    total_pages = max(1, -(-total_items // page_size))  # ceiling division
+    total_pages = max(1, -(-total_items // page_size))
 
     return ok({
         "data": products,

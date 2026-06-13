@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ChonkyChonk Products Lambda
+
+Globals:
+  Function:
+    Runtime:       python3.13
+    MemorySize:    256
+    Timeout:       30
+    Architectures: [x86_64]
+    Layers:
+      - !Ref SharedLayer
+    Environment:
+      Variables:
+        DB_HOST:     !Sub "${DBHost}"
+        DB_PORT:     !Sub "${DBPort}"
+        DB_USER:     !Sub "${DBUser}"
+        DB_PASSWORD: !Sub "${DBPassword}"
+        DB_NAME:     !Ref DBName
+
+Parameters:
+  Environment:
+    Type:    String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  DBName:
+    Type:    String
+    Default: chonky
+
+  DBHost:
+    Type:    String
+    Description: PostgreSQL RDS endpoint
+
+  DBPort:
+    Type:    String
+    Default: "5432"
+
+  DBUser:
+    Type:    String
+    Description: Database user
+
+  DBPassword:
+    Type:    String
+    NoEcho:  true
+    Description: Database password
+
+Resources:
+
+  # ----------------------------------------------------------
+  # Shared Layer  —  shared/python/ must contain __init__.py,
+  # db.py, and requirements.txt (with psycopg2-binary) at the
+  # shared/ level so SAM pip-installs it during sam build.
+  # ----------------------------------------------------------
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName:               !Sub chonkychonk-shared-${Environment}
+      ContentUri:              python/
+      CompatibleRuntimes:      [python3.13]
+      CompatibleArchitectures: [x86_64]
+    Metadata:
+      BuildMethod: python3.13
+
+  # ----------------------------------------------------------
+  # Products Lambda  —  GET /products
+  # ----------------------------------------------------------
+  ProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-products-${Environment}
+      CodeUri:      .
+      Handler:      lambda_handler.lambda_handler
+      Description:  GET /products
+      Events:
+        GetProducts:
+          Type: Api
+          Properties:
+            Path:   /products
+            Method: GET
+
+Outputs:
+  ProductsApi:
+    Description: Products endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/products"
+
+  ProductsFunctionArn:
+    Description: Products Lambda ARN
+    Value: !GetAtt ProductsFunction.Arn
