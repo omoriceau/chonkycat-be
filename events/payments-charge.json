@@ -1,0 +1,3 @@
+{
+  "body": "{\"event_type\": \"charge\", \"order_id\": 1, \"amount\": \"0.99\", \"currency\": \"CAD\", \"customer_email\": \"test@example.com\", \"description\": \"Test order\", \"payment_method_id\": \"pm_card_visa\"}"
+}

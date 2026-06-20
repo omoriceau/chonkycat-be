@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
+export STRIPE_SECRET_KEY_ARN=$(
+  aws secretsmanager create-secret \
+    --name chonkychonk/stripe-secret-key \
+    --secret-string "{\"STRIPE_SECRET_KEY\":\"$STRIPE_SECRET\"}" \
+    --query ARN --output text 2>/dev/null \
+  || \
+  aws secretsmanager put-secret-value \
+    --secret-id chonkychonk/stripe-secret-key \
+    --secret-string "{\"STRIPE_SECRET_KEY\":\"$STRIPE_SECRET\"}" \
+    --query ARN --output text \
+  || \
+  aws secretsmanager describe-secret \
+    --secret-id chonkychonk/stripe-secret-key \
+    --query ARN --output text
+)
+
 # ==============================================================================
 # Deploy script for products lambda only
 # ==============================================================================

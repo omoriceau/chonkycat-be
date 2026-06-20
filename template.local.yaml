@@ -11,6 +11,8 @@ Globals:
     MemorySize:    256
     Timeout:       30
     Architectures: [x86_64]
+    Layers:
+      - !Ref SharedLayer
     Environment:
       Variables:
         DB_HOST:         chonkychonk-db
@@ -24,6 +26,19 @@ Globals:
 # Resources — local dev only (no RDS/Secrets/SNS)
 # ============================================================
 Resources:
+
+  # ----------------------------------------------------------
+  # Shared Layer  —  contains shared/db.py and dependencies
+  # ----------------------------------------------------------
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName:                chonkychonk-shared-local
+      ContentUri:               shared/
+      CompatibleRuntimes:       [python3.13]
+      CompatibleArchitectures:  [x86_64]
+    Metadata:
+      BuildMethod: python3.13
 
   # ----------------------------------------------------------
   # EventBridge bus (local testing only)
@@ -127,6 +142,29 @@ Resources:
             Pattern:
               source:      ["chonkychonk.orders"]
               detail-type: ["OrderCreated"]
+
+  # ----------------------------------------------------------
+  # Payments API Lambda  —  POST /payments
+  # ----------------------------------------------------------
+  PaymentsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: chonkychonk-payments-api-local
+      CodeUri:      lambdas/payments_api
+      Handler:      lambda_handler.lambda_handler
+      Description:  Accepts POST /payments from frontend, emits to EventBridge
+      Environment:
+        Variables:
+          STRIPE_SECRET_KEY: sk_test_local
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: chonkychonk-bus
+      Events:
+        PostPayment:
+          Type: Api
+          Properties:
+            Path:   /payments
+            Method: POST
 
   # ----------------------------------------------------------
   # Email Lambda  —  EventBridge target (all email events)

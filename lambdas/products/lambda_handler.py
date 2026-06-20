@@ -48,10 +48,20 @@ def parse_int(value: str | None, default: int, min_val: int = 1, max_val: int | 
     return n
 
 
+def cors_headers() -> dict:
+    """Return CORS headers to allow cross-origin requests."""
+    return {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    }
+
+
 def ok(body: dict, status: int = 200) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": cors_headers(),
         "body": json.dumps(body, default=str),
     }
 
@@ -59,7 +69,7 @@ def ok(body: dict, status: int = 200) -> dict:
 def err(message: str, status: int = 400) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": cors_headers(),
         "body": json.dumps({"error": message}),
     }
 
@@ -78,6 +88,62 @@ def rows_to_dicts(column_metadata: list, records: list) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Single Product Handler
+# ---------------------------------------------------------------------------
+
+def _handle_get_product(db, product_id: str) -> dict:
+    """Fetch a single product by ID."""
+    try:
+        product_id_int = int(product_id)
+    except (ValueError, TypeError):
+        return err("Invalid product ID format", status=400)
+
+    sql = """
+        SELECT
+            p.id,
+            p.sku,
+            p.name,
+            p.description,
+            p.image_url,
+            p.category,
+            p.price,
+            p.qty             AS current_stock,
+            p.low_stock_threshold,
+            p.active,
+            CASE WHEN p.qty <= p.low_stock_threshold THEN 1 ELSE 0 END AS is_low_stock,
+            p.created_at,
+            p.updated_at
+        FROM products p
+        WHERE p.id = $1
+    """
+    
+    try:
+        resp = db.execute_statement(
+            sql=sql,
+            parameters=[{"name": "id", "value": {"longValue": product_id_int}}],
+            includeResultMetadata=True,
+        )
+        
+        if not resp.get("records"):
+            return err(f"Product with ID {product_id} not found", status=404)
+        
+        product = rows_to_dicts(resp["columnMetadata"], resp["records"])[0]
+        
+        return ok({
+            "data": product
+        })
+        
+    except ConnectionError as e:
+        print(f"[ERROR] Database connection error: {e}")
+        print(traceback.format_exc())
+        return err(f"Database connection failed: {str(e)}", status=503)
+    except Exception as e:
+        print(f"[ERROR] Unexpected database error: {e}")
+        print(traceback.format_exc())
+        return err(f"Database query failed: {str(e)}", status=500)
+
+
+# ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
@@ -93,6 +159,13 @@ def lambda_handler(event: dict, context) -> dict:
         print(f"[ERROR] Failed to create DB client: {e}")
         print(traceback.format_exc())
         return err("Failed to initialise database client", status=500)
+
+    # -- Check for product ID in path parameters ----------------------------
+    path_params = event.get("pathParameters") or {}
+    product_id = path_params.get("productid")
+    
+    if product_id:
+        return _handle_get_product(db, product_id)
 
     params = event.get("queryStringParameters") or {}
     print(f"[DEBUG] query params: {params}")

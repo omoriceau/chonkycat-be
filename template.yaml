@@ -90,7 +90,18 @@ Parameters:
   SnsOpsTopicArn:
     Type:        String
     Default:     ""
-    Description: SNS topic ARN for ops alerts
+    Description: SNS topic ARN for ops alerts (optional)
+
+  StripeSecretKeyArn:
+    Type:        String
+    Default:     ""
+    Description: ARN of the Secrets Manager secret holding STRIPE_SECRET_KEY
+
+# ============================================================
+# Conditions
+# ============================================================
+Conditions:
+  HasStripeSecret: !Not [!Equals [!Ref StripeSecretKeyArn, ""]]
 
 # ============================================================
 # Resources
@@ -130,7 +141,7 @@ Resources:
       Name: !Ref EventBusName
 
   # ----------------------------------------------------------
-  # Products Lambda  —  GET /products
+  # Products Lambda  —  GET /products and GET /products/{productid}
   # ----------------------------------------------------------
   ProductsFunction:
     Type: AWS::Serverless::Function
@@ -138,7 +149,7 @@ Resources:
       FunctionName: !Sub chonkychonk-products-${Environment}
       CodeUri:      lambdas/products/
       Handler:      lambda_handler.lambda_handler
-      Description:  GET /products
+      Description:  GET /products and GET /products/{productid}
       VpcConfig:
         SecurityGroupIds:
           - !Ref SecurityGroupId
@@ -149,7 +160,69 @@ Resources:
           Properties:
             Path:   /products
             Method: GET
+        GetProductById:
+          Type: Api
+          Properties:
+            Path:   /products/{productid}
+            Method: GET
 
+  # ----------------------------------------------------------
+  # Stripe Intent Lambda  —  NO VPC, calls Stripe API
+  # ----------------------------------------------------------
+  StripeIntentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-stripe-intent-${Environment}
+      CodeUri:      lambdas/stripe_intent/
+      Handler:      lambda_handler.lambda_handler
+      Description:  Calls Stripe PaymentIntent API (no VPC, needs public internet)
+      # No VpcConfig here intentionally
+      Environment:
+        Variables:
+          STRIPE_SECRET_KEY: !If [HasStripeSecret, !Sub "{{resolve:secretsmanager:${StripeSecretKeyArn}}}", ""]
+      Policies:
+        - !If
+          - HasStripeSecret
+          - AWSSecretsManagerGetSecretValuePolicy:
+              SecretArn: !Ref StripeSecretKeyArn
+          - !Ref AWS::NoValue
+
+  # ----------------------------------------------------------
+  # Payments Lambda  —  charge / refund via EventBridge
+  # ----------------------------------------------------------
+  # Update PaymentsApiFunction to pass StripeIntentFunction ARN and allow invoke
+  PaymentsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-payments-api-${Environment}
+      CodeUri:      lambdas/payments_api/
+      Handler:      lambda_handler.lambda_handler
+      Description:  Accepts POST /payments, creates orders, invokes StripeIntentFunction
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          STRIPE_SECRET_KEY:           !If [HasStripeSecret, !Sub "{{resolve:secretsmanager:${StripeSecretKeyArn}}}", ""]
+          STRIPE_INTENT_FUNCTION_ARN:  !GetAtt StripeIntentFunction.Arn
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StripeIntentFunction
+        - !If
+          - HasStripeSecret
+          - AWSSecretsManagerGetSecretValuePolicy:
+              SecretArn: !Ref StripeSecretKeyArn
+          - !Ref AWS::NoValue
+      Events:
+        PostPayment:
+          Type: Api
+          Properties:
+            Path:   /payments
+            Method: POST
+  
 # ============================================================
 # Outputs — printed after every deploy, useful for wiring
 # up WebSocket endpoint, Cognito, and frontend config
@@ -159,6 +232,18 @@ Outputs:
     Description: Products endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/products"
 
+  PaymentsApi:
+    Description: Payments endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/payments"
+
   EventBusArn:
     Description: EventBridge bus ARN
     Value: !GetAtt ChonkyEventBus.Arn
+
+  StripeIntentFunctionArn:
+    Description: Stripe Intent Lambda ARN
+    Value: !GetAtt StripeIntentFunction.Arn
+
+  PaymentsApiFunctionArn:
+    Description: Payments API Lambda ARN
+    Value: !GetAtt PaymentsApiFunction.Arn
