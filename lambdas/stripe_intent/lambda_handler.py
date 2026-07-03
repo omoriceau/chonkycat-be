@@ -1,15 +1,22 @@
 import json
 import logging
+import sys
 import os
 from decimal import Decimal
 
 import stripe
 
+# Add shared module to path for Lambda layer
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from shared.secrets import get_stripe_key
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 
+# Runs once on cold start, cached for warm invocations
+stripe.api_key = get_stripe_key()
 
 def lambda_handler(event, context):
     logger.info("stripe_intent event=%s", json.dumps(event, default=str))

@@ -1,20 +1,13 @@
 # samconfig.toml
 # Stores deployment settings per environment.
 # Safe to commit — contains no secrets.
-# Secrets are injected at deploy time from .env (local) or GitHub secrets (CI).
+# Secrets are injected at deploy time from environment variables or AWS Secrets Manager.
+#
+# Usage: sam deploy -g (guided), then sam deploy (automated)
+# Set environment variables before deploying: DB_HOST, DB_PORT, DB_USER, VPC_ID, etc.
+# Secret names should reference AWS Secrets Manager resources that exist in your account.
 
 version = 0.1
-
-# ============================================================
-# LOCAL — Docker + SAM local invoke (no AWS resources)
-# ============================================================
-[local.build.parameters]
-# Use template.local.yaml for local dev
-template = "template.local.yaml"
-
-[local.local_start_api.parameters]
-port = 3000
-warm_containers = "EAGER"
 
 # ============================================================
 # DEV
@@ -33,7 +26,7 @@ parameter_overrides = [
   "DBPort=$DB_PORT",
   "DBUser=$DB_USER",
   "DBPassword=$DB_PASSWORD",
-  "DBName=chonky",
+  "DBName=chonkydb",
   "VpcId=$VPC_ID",
   "SubnetIds=$SUBNET_IDS",
   "SecurityGroupId=$SECURITY_GROUP_ID",
@@ -43,6 +36,9 @@ parameter_overrides = [
   "CognitoAppClientId=none",
   "ApigwWsEndpoint=none",
   "SnsOpsTopicArn=none",
+  "DBPasswordSecretName=chonky/dev/db_pass",
+  "StripeSecretKeySecretName=chonky/dev/stripe_secret_key",
+  "SSHPrivateKeySecretName=chonky/dev/ssh_private_key",
 ]
 
 # ============================================================
@@ -62,7 +58,7 @@ parameter_overrides = [
   "DBPort=$DB_PORT",
   "DBUser=$DB_USER",
   "DBPassword=$DB_PASSWORD",
-  "DBName=chonky",
+  "DBName=chonkydb",
   "VpcId=$VPC_ID",
   "SubnetIds=$SUBNET_IDS",
   "SecurityGroupId=$SECURITY_GROUP_ID",
@@ -72,6 +68,9 @@ parameter_overrides = [
   "CognitoAppClientId=none",
   "ApigwWsEndpoint=none",
   "SnsOpsTopicArn=none",
+  "DBPasswordSecretName=chonky/staging/db_pass",
+  "StripeSecretKeySecretName=chonky/staging/stripe_secret_key",
+  "SSHPrivateKeySecretName=chonky/staging/ssh_private_key",
 ]
 
 # ============================================================
@@ -91,7 +90,7 @@ parameter_overrides = [
   "DBPort=$DB_PORT",
   "DBUser=$DB_USER",
   "DBPassword=$DB_PASSWORD",
-  "DBName=chonky",
+  "DBName=chonkydb",
   "VpcId=$VPC_ID",
   "SubnetIds=$SUBNET_IDS",
   "SecurityGroupId=$SECURITY_GROUP_ID",
@@ -101,4 +100,7 @@ parameter_overrides = [
   "CognitoAppClientId=$COGNITO_APP_CLIENT_ID",
   "ApigwWsEndpoint=$APIGW_WS_ENDPOINT",
   "SnsOpsTopicArn=$SNS_OPS_TOPIC_ARN",
+  "DBPasswordSecretName=chonky/prod/db_pass",
+  "StripeSecretKeySecretName=chonky/prod/stripe_secret_key",
+  "SSHPrivateKeySecretName=chonky/prod/ssh_private_key",
 ]

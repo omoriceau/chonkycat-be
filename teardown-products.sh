@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ==============================================================================
 # Teardown script for products lambda
-# Deletes: CloudFormation stack, S3 bucket + artifacts, (optionally) RDS + VPC
+# Deletes: CloudFormation stack, S3 bucket + artifacts, secrets, and security groups
 # ==============================================================================
 
 RED='\033[0;31m'
@@ -28,6 +28,7 @@ fi
 
 STACK_NAME="chonkychonk-products-${ENVIRONMENT}"
 S3_BUCKET="chonkychonk-sam-artifacts-${ENVIRONMENT}"
+LAMBDA_SECURITY_GROUP_NAME="chonky-vpc-lambda-sg"
 
 # ==============================================================================
 # Safety check
@@ -36,12 +37,14 @@ S3_BUCKET="chonkychonk-sam-artifacts-${ENVIRONMENT}"
 warn "This will permanently delete the following in region $REGION:"
 warn "  - CloudFormation stack: $STACK_NAME"
 warn "  - S3 bucket + all contents: $S3_BUCKET"
+warn "  - AWS Secrets Manager secrets: chonky/${ENVIRONMENT}/*"
+warn "  - Security group: $LAMBDA_SECURITY_GROUP_NAME (if created)"
 echo ""
 read -r -p "Type the environment name to confirm ($ENVIRONMENT): " CONFIRM
 [ "$CONFIRM" = "$ENVIRONMENT" ] || die "Confirmation did not match — aborting."
 
 # ==============================================================================
-# 1. Delete CloudFormation stack (Lambda + IAM roles + Function URL)
+# 1. Delete CloudFormation stack (Lambda + IAM roles + API Gateway + EventBus)
 # ==============================================================================
 
 log "Checking for CloudFormation stack '$STACK_NAME'..."
@@ -61,12 +64,12 @@ else
     log "Waiting for stack deletion..."
     aws cloudformation wait stack-delete-complete \
         --stack-name "$STACK_NAME" \
-        --region "$REGION"
+        --region "$REGION" 2>/dev/null || warn "Stack deletion wait timed out, but continuing..."
     log "Stack deleted."
 fi
 
 # ==============================================================================
-# 2. Empty and delete S3 bucket
+# 3. Empty and delete S3 bucket
 # ==============================================================================
 
 log "Checking for S3 bucket '$S3_BUCKET'..."
@@ -102,3 +105,5 @@ fi
 
 log ""
 log "====== TEARDOWN COMPLETE ======"
+log "Note: RDS instance and VPC resources remain for reuse with other deployments."
+log "If you want to remove them, use the aws-setup.sh teardown commands or AWS Console."

@@ -1,27 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
-export STRIPE_SECRET_KEY_ARN=$(
-  aws secretsmanager create-secret \
-    --name chonkychonk/stripe-secret-key \
-    --secret-string "{\"STRIPE_SECRET_KEY\":\"$STRIPE_SECRET\"}" \
-    --query ARN --output text 2>/dev/null \
-  || \
-  aws secretsmanager put-secret-value \
-    --secret-id chonkychonk/stripe-secret-key \
-    --secret-string "{\"STRIPE_SECRET_KEY\":\"$STRIPE_SECRET\"}" \
-    --query ARN --output text \
-  || \
-  aws secretsmanager describe-secret \
-    --secret-id chonkychonk/stripe-secret-key \
-    --query ARN --output text
-)
-
-# ==============================================================================
-# Deploy script for products lambda only
-# ==============================================================================
-
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,8 +18,17 @@ die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 ENVIRONMENT="${1:-dev}"
 REGION="${2:-us-east-1}"
 
-if [[ ! "$ENVIRONMENT" =~ ^(dev|staging|prod)$ ]]; then
-    die "Invalid environment: $ENVIRONMENT. Must be dev, staging, or prod."
+case "$ENVIRONMENT" in
+  dev|staging|prod)
+    ;;
+  *)
+    die "Invalid environment: '$ENVIRONMENT'. Must be dev, staging, or prod."
+    ;;
+esac
+
+# Check if STRIPE_SECRET_KEY is provided
+if [ -z "${STRIPE_SECRET_KEY:-}" ]; then
+    die "STRIPE_SECRET_KEY environment variable is not set. Please set it before running this script."
 fi
 
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
@@ -61,8 +49,7 @@ log "RDS endpoint: $DB_HOST"
 
 # Database credentials (from aws-setup.sh)
 DB_USER="chonky_admin"
-DB_PASSWORD="Ch0nky_Secure_P4ss_2026!"
-DB_NAME="chonky"
+DB_NAME="chonkydb"
 DB_PORT="5432"
 
 # VPC configuration — required for Lambda to access RDS
@@ -174,6 +161,39 @@ STACK_NAME="chonkychonk-products-${ENVIRONMENT}"
 
 log "Deploying stack: $STACK_NAME"
 
+# Check if stack exists and is in a failed state
+STACK_STATUS=$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --region "$REGION" \
+    --query 'Stacks[0].StackStatus' \
+    --output text 2>/dev/null || echo "")
+
+if [[ "$STACK_STATUS" == "UPDATE_ROLLBACK_FAILED" ]]; then
+    log "Stack is in UPDATE_ROLLBACK_FAILED state, deleting it..."
+    aws cloudformation delete-stack \
+        --stack-name "$STACK_NAME" \
+        --region "$REGION"
+    
+    log "Waiting for stack deletion to complete..."
+    aws cloudformation wait stack-delete-complete \
+        --stack-name "$STACK_NAME" \
+        --region "$REGION" 2>/dev/null || warn "Stack deletion check timed out, proceeding anyway..."
+    
+    log "Stack deleted successfully"
+fi
+
+# Build parameter overrides for all required parameters
+PARAM_OVERRIDES="ParameterKey=DBHost,ParameterValue=$DB_HOST \
+ParameterKey=DBPort,ParameterValue=$DB_PORT \
+ParameterKey=DBUser,ParameterValue=$DB_USER \
+ParameterKey=DBName,ParameterValue=$DB_NAME \
+ParameterKey=VpcId,ParameterValue=$VPC_ID \
+ParameterKey=SubnetIds,ParameterValue=$SUBNET_IDS \
+ParameterKey=SecurityGroupId,ParameterValue=$SECURITY_GROUP_ID \
+ParameterKey=DBPasswordSecretName,ParameterValue=chonky/${ENVIRONMENT}/db_pass \
+ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key \
+ParameterKey=SSHPrivateKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/ssh_private_key"
+
 sam deploy \
     --template-file .aws-sam/build/template.yaml \
     --stack-name "$STACK_NAME" \
@@ -181,16 +201,7 @@ sam deploy \
     --s3-bucket "$S3_BUCKET" \
     --capabilities CAPABILITY_IAM \
     --no-confirm-changeset \
-    --parameter-overrides \
-        Environment="$ENVIRONMENT" \
-        DBHost="$DB_HOST" \
-        DBPort="$DB_PORT" \
-        DBUser="$DB_USER" \
-        DBPassword="$DB_PASSWORD" \
-        DBName="$DB_NAME" \
-        VpcId="$VPC_ID" \
-        SubnetIds="$SUBNET_IDS" \
-        SecurityGroupId="$SECURITY_GROUP_ID"
+    --parameter-overrides $PARAM_OVERRIDES
 
 # ==============================================================================
 # Output

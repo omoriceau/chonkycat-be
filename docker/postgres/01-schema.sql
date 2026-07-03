@@ -44,6 +44,7 @@ CREATE TABLE public.orders (
   shipping_country VARCHAR(100),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  deleted_at TIMESTAMP NULL,
   FOREIGN KEY (user_id) REFERENCES public.users (id)
 );
 

@@ -5,11 +5,12 @@ Retrieves credentials from AWS Secrets Manager or environment variables.
 """
 
 import os
+import sys
 import psycopg2
 import psycopg2.extras
 from typing import Any
 
-from shared.secrets import get_db_password
+from secrets import get_db_password
 
 
 class PostgreSQLClient:

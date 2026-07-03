@@ -1,12 +1,19 @@
 """
 Simple PostgreSQL helper for AWS Lambda / local dev.
 Uses psycopg2 directly.
+Retrieves credentials from AWS Secrets Manager or environment variables.
 """
 
 import os
+import sys
 import psycopg2
 import psycopg2.extras
 from typing import Optional, Any
+
+# Add shared module to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from shared.secrets import get_db_password
 
 
 class PostgreSQLClient:
@@ -15,11 +22,33 @@ class PostgreSQLClient:
         self._connect()
 
     def _connect(self):
-        db_host = os.environ.get("DB_HOST", "localhost")
-        db_port = int(os.environ.get("DB_PORT", "5432"))
-        db_user = os.environ.get("DB_USER", "chonky_admin")
-        db_password = os.environ.get("DB_PASSWORD", "")
-        db_name = os.environ.get("DB_NAME", "chonky")
+        # Environment variables MUST be set by Lambda configuration
+        db_host = os.environ.get("DB_HOST")
+        db_port_str = os.environ.get("DB_PORT")
+        db_user = os.environ.get("DB_USER")
+        db_name = os.environ.get("DB_NAME")
+
+        # Validate required connection parameters
+        missing_vars = []
+        if not db_host:
+            missing_vars.append("DB_HOST")
+        if not db_port_str:
+            missing_vars.append("DB_PORT")
+        if not db_user:
+            missing_vars.append("DB_USER")
+        if not db_name:
+            missing_vars.append("DB_NAME")
+
+        if missing_vars:
+            raise RuntimeError(
+                f"Missing required environment variables: {', '.join(missing_vars)}. "
+                f"Ensure the Lambda function is configured with these environment variables via SAM template or AWS console."
+            )
+
+        # Retrieve password from AWS Secrets Manager (with fallback to env var)
+        db_password = get_db_password()
+
+        db_port = int(db_port_str)
 
         self.connection = psycopg2.connect(
             host=db_host,

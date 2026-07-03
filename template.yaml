@@ -15,12 +15,14 @@ Globals:
       - !Ref SharedLayer
     Environment:
       Variables:
-        DB_HOST:        !Sub "${DBHost}"
-        DB_PORT:        !Sub "${DBPort}"
-        DB_USER:        !Sub "${DBUser}"
-        DB_PASSWORD:    !Sub "${DBPassword}"
-        DB_NAME:        !Ref DBName
-        EVENT_BUS_NAME: !Ref EventBusName
+        DB_HOST:                        !Sub "${DBHost}"
+        DB_PORT:                        !Sub "${DBPort}"
+        DB_USER:                        !Sub "${DBUser}"
+        DB_NAME:                        !Ref DBName
+        EVENT_BUS_NAME:                 !Ref EventBusName
+        DB_PASSWORD_SECRET_NAME:        !Ref DBPasswordSecretName
+        STRIPE_SECRET_KEY_SECRET_NAME:  !Ref StripeSecretKeySecretName
+        SSH_PRIVATE_KEY_SECRET_NAME:    !Ref SSHPrivateKeySecretName
 
 # ============================================================
 # Parameters — set per environment via samconfig.toml
@@ -51,7 +53,7 @@ Parameters:
   DBPassword:
     Type:    String
     NoEcho:  true
-    Description: Database password
+    Description: Database password (deprecated - now uses AWS Secrets Manager)
 
   VpcId:
     Type:        AWS::EC2::VPC::Id
@@ -97,6 +99,21 @@ Parameters:
     Default:     ""
     Description: ARN of the Secrets Manager secret holding STRIPE_SECRET_KEY
 
+  DBPasswordSecretName:
+    Type:    String
+    Default: "chonky/dev/db_pass"
+    Description: Name of the Secrets Manager secret holding DB_PASSWORD
+
+  StripeSecretKeySecretName:
+    Type:    String
+    Default: "chonky/dev/stripe_secret_key"
+    Description: Name of the Secrets Manager secret holding STRIPE_SECRET_KEY
+
+  SSHPrivateKeySecretName:
+    Type:    String
+    Default: "chonky/dev/ssh_private_key"
+    Description: Name of the Secrets Manager secret holding SSH_PRIVATE_KEY for schema loader
+
 # ============================================================
 # Conditions
 # ============================================================
@@ -126,7 +143,7 @@ Resources:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName:                !Sub chonkychonk-shared-${Environment}
-      ContentUri:               shared/
+      ContentUri:               shared/python/
       CompatibleRuntimes:       [python3.13]
       CompatibleArchitectures:  [x86_64]
     Metadata:
@@ -154,6 +171,14 @@ Resources:
         SecurityGroupIds:
           - !Ref SecurityGroupId
         SubnetIds: !Ref SubnetIds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
       Events:
         GetProducts:
           Type: Api
@@ -177,15 +202,58 @@ Resources:
       Handler:      lambda_handler.lambda_handler
       Description:  Calls Stripe PaymentIntent API (no VPC, needs public internet)
       # No VpcConfig here intentionally
-      Environment:
-        Variables:
-          STRIPE_SECRET_KEY: !If [HasStripeSecret, !Sub "{{resolve:secretsmanager:${StripeSecretKeyArn}}}", ""]
       Policies:
-        - !If
-          - HasStripeSecret
-          - AWSSecretsManagerGetSecretValuePolicy:
-              SecretArn: !Ref StripeSecretKeyArn
-          - !Ref AWS::NoValue
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StripeSecretKeySecretName}-*"
+
+  # ----------------------------------------------------------
+  # Orders Lambda  —  POST/GET/PUT/DELETE /orders (shopping cart)
+  # ----------------------------------------------------------
+  OrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-orders-${Environment}
+      CodeUri:      lambdas/orders/
+      Handler:      lambda_handler.lambda_handler
+      Description:  Shopping cart CRUD - POST/GET/PUT/DELETE /orders
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+      Events:
+        PostOrders:
+          Type: Api
+          Properties:
+            Path:   /orders
+            Method: POST
+        GetOrder:
+          Type: Api
+          Properties:
+            Path:   /orders/{orderId}
+            Method: GET
+        PutOrder:
+          Type: Api
+          Properties:
+            Path:   /orders/{orderId}
+            Method: PUT
+        DeleteOrder:
+          Type: Api
+          Properties:
+            Path:   /orders/{orderId}
+            Method: DELETE
 
   # ----------------------------------------------------------
   # Payments Lambda  —  charge / refund via EventBridge
@@ -204,18 +272,19 @@ Resources:
         SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
-          STRIPE_SECRET_KEY:           !If [HasStripeSecret, !Sub "{{resolve:secretsmanager:${StripeSecretKeyArn}}}", ""]
-          STRIPE_INTENT_FUNCTION_ARN:  !GetAtt StripeIntentFunction.Arn
+          STRIPE_INTENT_FUNCTION_ARN: !GetAtt StripeIntentFunction.Arn
       Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
         - LambdaInvokePolicy:
             FunctionName: !Ref StripeIntentFunction
-        - !If
-          - HasStripeSecret
-          - AWSSecretsManagerGetSecretValuePolicy:
-              SecretArn: !Ref StripeSecretKeyArn
-          - !Ref AWS::NoValue
       Events:
         PostPayment:
           Type: Api
@@ -232,6 +301,10 @@ Outputs:
     Description: Products endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/products"
 
+  OrdersApi:
+    Description: Orders (shopping cart) endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+
   PaymentsApi:
     Description: Payments endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/payments"
@@ -247,3 +320,7 @@ Outputs:
   PaymentsApiFunctionArn:
     Description: Payments API Lambda ARN
     Value: !GetAtt PaymentsApiFunction.Arn
+
+  OrdersFunctionArn:
+    Description: Orders Lambda ARN
+    Value: !GetAtt OrdersFunction.Arn

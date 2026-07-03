@@ -2,7 +2,83 @@
 
 AWS Lambda backend for the ChonkyChonk cat food store.
 
+## AWS Secrets Manager Setup
+
+This application uses AWS Secrets Manager to securely manage sensitive credentials. You must create the following secrets in your AWS account before deploying:
+
+### Required Secrets
+
+Create these secrets in AWS Secrets Manager for each environment (dev, staging, prod):
+
+#### Database Password
+- **Name**: `chonky/{environment}/db_pass`
+- **Value**: Plain text or JSON (e.g., `{"password": "your-db-password"}`)
+- **Used by**: All Lambdas that connect to RDS
+
+#### Stripe Secret Key
+- **Name**: `chonky/{environment}/stripe_secret_key`
+- **Value**: Plain text or JSON (e.g., `{"key": "sk_test_..."}`)
+- **Used by**: stripe_intent, payments_api Lambdas
+
+#### SSH Private Key (EC2 Schema Loader)
+- **Name**: `chonky/{environment}/ssh_private_key`
+- **Value**: Plain text SSH private key content
+- **Used by**: Terraform for EC2 provisioning
+
+### Creating Secrets (AWS CLI)
+
+```bash
+# Set environment
+ENV=dev
+
+# Create DB password secret
+aws secretsmanager create-secret \
+  --name chonky/${ENV}/db_pass \
+  --secret-string "your-postgres-password" \
+  --region ca-central-1
+
+# Create Stripe secret
+aws secretsmanager create-secret \
+  --name chonky/${ENV}/stripe_secret_key \
+  --secret-string "sk_test_51Tj1XX..." \
+  --region ca-central-1
+
+# Create SSH key secret
+aws secretsmanager create-secret \
+  --name chonky/${ENV}/ssh_private_key \
+  --secret-string "$(cat ~/.ssh/chonky.pem)" \
+  --region ca-central-1
+```
+
+### Environment Variables for Local Development
+
+For local development, the code falls back to environment variables if AWS Secrets Manager is not available. Set these in `.env.local`:
+
+```bash
+# Local fallbacks (used if AWS Secrets Manager lookup fails)
+DB_PASSWORD=chonky_password
+STRIPE_SECRET_KEY=sk_test_...
+SSH_PRIVATE_KEY=$(cat ~/.ssh/chonky.pem)
+
+# Secret names (can also be overridden)
+DB_PASSWORD_SECRET_NAME=chonky/dev/db_pass
+STRIPE_SECRET_KEY_SECRET_NAME=chonky/dev/stripe_secret_key
+SSH_PRIVATE_KEY_SECRET_NAME=chonky/dev/ssh_private_key
+```
+
+### Terraform Integration (EC2 Schema Loader)
+
+The EC2 schema loader retrieves the SSH private key from Secrets Manager:
+
+```bash
+export TF_VAR_ssh_key_secret_name="chonky/dev/ssh_private_key"
+export TF_VAR_key_name="chonky"
+export TF_VAR_allowed_ssh_cidr="$(curl -s https://checkip.amazonaws.com)/32"
+terraform apply -backend-config=backend/dev.hcl
+```
+
 ## Structure
+
 
 ```
 chonkychonk-backend/

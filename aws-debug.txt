@@ -1,6 +1,0 @@
-#delete subnets
-aws ec2 describe-subnets --filters "Name=tag:Name,Values=chonky-subnet-a"
-aws ec2 delete-subnet --subnet-id subnet-0050dac704ae37d11
-
-# delete db subnet
-aws rds delete-db-subnet-group --db-subnet-group-name chonky-subnet-group

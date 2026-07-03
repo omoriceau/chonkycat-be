@@ -1,13 +1,18 @@
 """
 Database helper for local and AWS RDS PostgreSQL.
 Uses psycopg2 to connect directly to PostgreSQL.
+Retrieves credentials from AWS Secrets Manager or environment variables.
 """
 
 import os
+import sys
 import psycopg2
 import psycopg2.extras
 from typing import Any
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from shared.secrets import get_db_password
 
 class PostgreSQLClient:
     """Wrapper to provide RDS Data API-like interface using direct PostgreSQL connection."""
@@ -17,12 +22,34 @@ class PostgreSQLClient:
         self._connect()
 
     def _connect(self):
-        """Connect to PostgreSQL database."""
-        db_host     = os.environ.get("DB_HOST", "localhost")
-        db_port     = int(os.environ.get("DB_PORT", "5432"))
-        db_user     = os.environ.get("DB_USER", "chonky_admin")
-        db_password = os.environ.get("DB_PASSWORD", "")
-        db_name     = os.environ.get("DB_NAME", "chonky")
+        """Connect to PostgreSQL database using environment variables and AWS Secrets Manager."""
+        # Environment variables MUST be set by Lambda configuration
+        db_host = os.environ.get("DB_HOST")
+        db_port_str = os.environ.get("DB_PORT")
+        db_user = os.environ.get("DB_USER")
+        db_name = os.environ.get("DB_NAME")
+
+        # Validate required connection parameters
+        missing_vars = []
+        if not db_host:
+            missing_vars.append("DB_HOST")
+        if not db_port_str:
+            missing_vars.append("DB_PORT")
+        if not db_user:
+            missing_vars.append("DB_USER")
+        if not db_name:
+            missing_vars.append("DB_NAME")
+
+        if missing_vars:
+            raise RuntimeError(
+                f"Missing required environment variables: {', '.join(missing_vars)}. "
+                f"Ensure the Lambda function is configured with these environment variables via SAM template or AWS console."
+            )
+
+        # Retrieve password from AWS Secrets Manager (with fallback to env var)
+        db_password = get_db_password()
+
+        db_port = int(db_port_str)
 
         print(f"[DB] Connecting to {db_host}:{db_port} db={db_name} user={db_user}")
         self.connection = psycopg2.connect(
@@ -138,6 +165,4 @@ class PostgreSQLClient:
 
 
 def get_db_client() -> PostgreSQLClient:
-    db_host = os.environ.get("DB_HOST", "localhost")
-    print(f"[DB] Creating client (host: {db_host})")
     return PostgreSQLClient()
