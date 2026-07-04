@@ -307,6 +307,60 @@ Resources:
             Method: DELETE
 
   # ----------------------------------------------------------
+  # Users Lambda  —  POST/GET/PUT/DELETE /users (user management)
+  # ----------------------------------------------------------
+  UsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-users-${Environment}
+      CodeUri:      lambdas/users/
+      Handler:      lambda_handler.lambda_handler
+      Description:  User CRUD - POST/GET/PUT/DELETE /users
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+      Events:
+        GetUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users
+            Method: GET
+        GetUserById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users/{userId}
+            Method: GET
+        PostUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users
+            Method: POST
+        PutUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users/{userId}
+            Method: PUT
+        DeleteUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users/{userId}
+            Method: DELETE
+
+  # ----------------------------------------------------------
   # Payments Lambda  —  charge / refund via EventBridge
   # ----------------------------------------------------------
   # Update PaymentsApiFunction to pass StripeIntentFunction ARN and allow invoke
@@ -353,6 +407,10 @@ Outputs:
     Description: Products endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/products"
 
+  UsersApi:
+    Description: Users endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/users"
+
   OrdersApi:
     Description: Orders (shopping cart) endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/orders"
@@ -368,6 +426,10 @@ Outputs:
   StripeIntentFunctionArn:
     Description: Stripe Intent Lambda ARN
     Value: !GetAtt StripeIntentFunction.Arn
+
+  UsersFunctionArn:
+    Description: Users Lambda ARN
+    Value: !GetAtt UsersFunction.Arn
 
   PaymentsApiFunctionArn:
     Description: Payments API Lambda ARN
