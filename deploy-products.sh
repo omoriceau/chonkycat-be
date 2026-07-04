@@ -26,11 +26,6 @@ case "$ENVIRONMENT" in
     ;;
 esac
 
-# Check if STRIPE_SECRET_KEY is provided
-if [ -z "${STRIPE_SECRET_KEY:-}" ]; then
-    die "STRIPE_SECRET_KEY environment variable is not set. Please set it before running this script."
-fi
-
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
 
 # Get RDS endpoint

@@ -25,7 +25,7 @@ from shared.events import (
     LOW_STOCK_DETECTED,
 )
 
-from orders.models import (
+from models import (
     CreateOrderRequest,
     ResolvedOrder,
     ResolvedOrderItem,
@@ -53,17 +53,12 @@ class OrderService:
 
     def __init__(
         self,
-        db_cluster_arn: str,
-        db_secret_arn: str,
-        db_name: str,
-        rds_client=None,
+        db_client=None,
         events_client=None,
     ):
-        self._cluster_arn = db_cluster_arn
-        self._secret_arn  = db_secret_arn
-        self._db_name     = db_name
-        self._rds         = rds_client    or boto3.client("rds-data")
-        self._events      = events_client or boto3.client("events")
+        from db import PostgreSQLClient
+        self._db      = db_client       or PostgreSQLClient()
+        self._events  = events_client   or boto3.client("events")
 
     # ------------------------------------------------------------------
     # Public
@@ -134,7 +129,7 @@ class OrderService:
         product_ids = [i.product_id for i in items]
 
         # Fetch all requested products in one query
-        placeholders = ", ".join(f":pid{n}" for n in range(len(product_ids)))
+        placeholders = ", ".join(f"${n+1}" for n in range(len(product_ids)))
         sql = f"""
             SELECT id, name, price, qty, active
             FROM   products
@@ -186,7 +181,7 @@ class OrderService:
         sql = """
             SELECT id, discount_type, discount_value, active, expires_at
             FROM   promotions
-            WHERE  code = :code
+            WHERE  code = $1
             LIMIT  1
         """
         resp = self._execute(
@@ -219,7 +214,7 @@ class OrderService:
     # ------------------------------------------------------------------
 
     def _insert_order(self, o: ResolvedOrder) -> int:
-        # 1. Insert order row
+        # 1. Insert order row with RETURNING to get the ID
         sql = """
             INSERT INTO orders (
                 user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
@@ -227,11 +222,12 @@ class OrderService:
                 shipping_name, shipping_address1, shipping_address2,
                 shipping_city, shipping_province, shipping_postal_code, shipping_country
             ) VALUES (
-                :user_id, 'pending', :subtotal, :tax, :shipping, :total,
-                :notes, :connection_id,
-                :s_name, :s_addr1, :s_addr2,
-                :s_city, :s_prov, :s_postal, :s_country
+                $1, 'pending', $2, $3, $4, $5,
+                $6, $7,
+                $8, $9, $10,
+                $11, $12, $13, $14
             )
+            RETURNING id
         """
         params = [
             {"name": "user_id",       "value": {"longValue":   o.user_id}},
@@ -250,7 +246,7 @@ class OrderService:
             {"name": "s_country",     "value": {"stringValue": o.shipping.country}},
         ]
 
-        resp     = self._execute(sql, params, "insert_order")
+        resp     = self._execute(sql, params, "insert_order", include_metadata=True)
         order_id = resp["generatedFields"][0]["longValue"]
 
         # 2. Insert order items
@@ -259,22 +255,28 @@ class OrderService:
                 INSERT INTO order_items
                   (order_id, product_id, quantity, unit_price, line_total, name_snapshot)
                 VALUES
-                  (:order_id, :product_id, :qty, :unit_price, :line_total, :name)
+                  ($1, $2, $3, $4, $5, $6)
+                RETURNING id
             """
-            self._execute(item_sql, [
-                {"name": "order_id",   "value": {"longValue":   order_id}},
-                {"name": "product_id", "value": {"longValue":   item.product_id}},
-                {"name": "qty",        "value": {"longValue":   item.quantity}},
-                {"name": "unit_price", "value": {"stringValue": str(item.unit_price)}},
-                {"name": "line_total", "value": {"stringValue": str(item.line_total)}},
-                {"name": "name",       "value": {"stringValue": item.name_snapshot}},
-            ], "insert_order_item")
+            try:
+                self._execute(item_sql, [
+                    {"name": "order_id",   "value": {"longValue":   order_id}},
+                    {"name": "product_id", "value": {"longValue":   item.product_id}},
+                    {"name": "qty",        "value": {"longValue":   item.quantity}},
+                    {"name": "unit_price", "value": {"stringValue": str(item.unit_price)}},
+                    {"name": "line_total", "value": {"stringValue": str(item.line_total)}},
+                    {"name": "name",       "value": {"stringValue": item.name_snapshot}},
+                ], "insert_order_item", include_metadata=True)
+                logger.info("Order item inserted | order_id=%s product_id=%s qty=%s", order_id, item.product_id, item.quantity)
+            except Exception as e:
+                logger.error("Failed to insert order item | order_id=%s product_id=%s: %s", order_id, item.product_id, e)
+                raise
 
         # 3. Insert order promotion (if any)
         if o.promotion_id:
             promo_sql = """
                 INSERT INTO order_promotions (order_id, promotion_id, discount_amount)
-                VALUES (:order_id, :promo_id, :discount)
+                VALUES ($1, $2, $3)
             """
             self._execute(promo_sql, [
                 {"name": "order_id",  "value": {"longValue":   order_id}},
@@ -355,7 +357,7 @@ class OrderService:
         to or below their low stock threshold. If so, emit LowStockDetected.
         """
         product_ids   = [i.product_id for i in items]
-        placeholders  = ", ".join(f":pid{n}" for n in range(len(product_ids)))
+        placeholders  = ", ".join(f"${n+1}" for n in range(len(product_ids)))
         sql = f"""
             SELECT id, sku, name, category, qty AS current_stock, low_stock_threshold
             FROM   products
@@ -401,15 +403,12 @@ class OrderService:
 
     def _execute(self, sql: str, params: list, label: str, include_metadata: bool = False) -> dict:
         try:
-            return self._rds.execute_statement(
-                resourceArn=self._cluster_arn,
-                secretArn=self._secret_arn,
-                database=self._db_name,
+            return self._db.execute_statement(
                 sql=sql,
                 parameters=params,
                 includeResultMetadata=include_metadata,
             )
-        except ClientError as e:
+        except Exception as e:
             logger.error("DB error [%s]: %s", label, e)
             raise
 

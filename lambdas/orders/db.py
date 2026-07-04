@@ -108,13 +108,26 @@ class PostgreSQLClient:
                 cursor_factory=psycopg2.extras.RealDictCursor
             ) as cursor:
                 cursor.execute(sql_formatted, param_values)
-                rows = cursor.fetchall()
+                
+                # For INSERT/UPDATE/DELETE with RETURNING, fetch results
+                if cursor.description:
+                    rows = cursor.fetchall()
+                else:
+                    rows = []
+                
                 description = cursor.description
         except Exception as e:
             print(f"[DB] Query error: {e}")
             raise
 
-        return self._format_response(rows, description, includeResultMetadata)
+        # For INSERT statements with RETURNING clause, extract the generated ID
+        response = self._format_response(rows, description, includeResultMetadata)
+        
+        # If this was an INSERT and we got back an id, format it as generatedFields
+        if rows and "id" in rows[0]:
+            response["generatedFields"] = [{"longValue": rows[0]["id"]}]
+        
+        return response
 
     @staticmethod
     def _extract_value(value_dict: dict) -> Any:

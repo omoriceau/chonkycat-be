@@ -31,7 +31,7 @@ Parameters:
   Environment:
     Type:    String
     Default: dev
-    AllowedValues: [dev, staging, prod]
+    AllowedValues: [dev]
 
   DBName:
     Type:    String
@@ -49,11 +49,6 @@ Parameters:
   DBUser:
     Type:    String
     Description: Database user
-
-  DBPassword:
-    Type:    String
-    NoEcho:  true
-    Description: Database password (deprecated - now uses AWS Secrets Manager)
 
   VpcId:
     Type:        AWS::EC2::VPC::Id
@@ -126,6 +121,15 @@ Conditions:
 Resources:
 
   # ----------------------------------------------------------
+  # API Gateway (implicit)  —  auto-created by SAM for all
+  # Lambda API events. No explicit stage name = root path.
+  # ----------------------------------------------------------
+  ServerlessRestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+
+  # ----------------------------------------------------------
   # Shared Layer  —  contains shared/db.py and any other
   # common modules used across Lambdas.
   #
@@ -183,11 +187,13 @@ Resources:
         GetProducts:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /products
             Method: GET
         GetProductById:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /products/{productid}
             Method: GET
 
@@ -212,6 +218,37 @@ Resources:
                 - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StripeSecretKeySecretName}-*"
 
   # ----------------------------------------------------------
+  # Orders Email Lambda  —  sends confirmation/failure emails via SES
+  # ----------------------------------------------------------
+  OrdersEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-orders-email-${Environment}
+      CodeUri:      lambdas/orders_email/
+      Handler:      lambda_handler.lambda_handler
+      Description:  Sends order confirmation and failure emails via SES
+      # No VPC needed — only calls SES API
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+      Events:
+        OrderCreatedEvent:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:
+                - chonkychonk.orders
+              detail-type:
+                - OrderCreated
+                - OrderFailure
+
+  # ----------------------------------------------------------
   # Orders Lambda  —  POST/GET/PUT/DELETE /orders (shopping cart)
   # ----------------------------------------------------------
   OrdersFunction:
@@ -233,25 +270,31 @@ Resources:
                 - secretsmanager:GetSecretValue
               Resource:
                 - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
       Events:
         PostOrders:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /orders
             Method: POST
         GetOrder:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /orders/{orderId}
             Method: GET
         PutOrder:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /orders/{orderId}
             Method: PUT
         DeleteOrder:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /orders/{orderId}
             Method: DELETE
 
@@ -289,6 +332,7 @@ Resources:
         PostPayment:
           Type: Api
           Properties:
+            RestApiId: !Ref ServerlessRestApi
             Path:   /payments
             Method: POST
   
@@ -299,15 +343,15 @@ Resources:
 Outputs:
   ProductsApi:
     Description: Products endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/products"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/products"
 
   OrdersApi:
     Description: Orders (shopping cart) endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/orders"
 
   PaymentsApi:
     Description: Payments endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/payments"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/payments"
 
   EventBusArn:
     Description: EventBridge bus ARN

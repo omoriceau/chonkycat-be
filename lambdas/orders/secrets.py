@@ -73,9 +73,9 @@ def get_db_password() -> str:
     """
     Retrieve the database password from AWS Secrets Manager or environment variables.
     
-    Checks for:
-    1. AWS Secrets Manager secret named from DB_PASSWORD_SECRET_NAME env var
-    2. Fallback to DB_PASSWORD environment variable
+    Priority:
+    1. DB_PASSWORD environment variable (for local development)
+    2. AWS Secrets Manager secret named from DB_PASSWORD_SECRET_NAME env var
     
     Returns:
         The database password
@@ -83,28 +83,26 @@ def get_db_password() -> str:
     Raises:
         RuntimeError: If password cannot be retrieved
     """
+    # Try direct env var first (for local development)
+    db_password = os.environ.get('DB_PASSWORD')
+    if db_password:
+        print(f"[INFO] Using DB_PASSWORD environment variable")
+        return db_password
+    
+    # Try AWS Secrets Manager
     secret_name = os.environ.get('DB_PASSWORD_SECRET_NAME', 'chonky/dev/db_pass')
     try:
         return get_secret(secret_name)
     except RuntimeError:
-        # Try direct env var as final fallback
-        db_password = os.environ.get('DB_PASSWORD')
-        if db_password:
-            print(f"[INFO] Using DB_PASSWORD environment variable as fallback")
-            return db_password
         raise RuntimeError(
-            "Database password not found. Set DB_PASSWORD_SECRET_NAME to point to AWS Secrets Manager, "
-            "or set DB_PASSWORD environment variable."
+            "Database password not found. Set DB_PASSWORD environment variable (for local dev) "
+            "or DB_PASSWORD_SECRET_NAME to point to AWS Secrets Manager (for production)."
         )
 
 
 def get_stripe_key() -> str:
     """
     Retrieve the Stripe secret key from AWS Secrets Manager or environment variables.
-    
-    Checks for:
-    1. AWS Secrets Manager secret named from STRIPE_SECRET_KEY_SECRET_NAME env var
-    2. Fallback to STRIPE_SECRET_KEY environment variable
     
     Returns:
         The Stripe secret key
@@ -130,10 +128,6 @@ def get_stripe_key() -> str:
 def get_ssh_private_key() -> str:
     """
     Retrieve the SSH private key from AWS Secrets Manager or environment variables.
-    
-    Checks for:
-    1. AWS Secrets Manager secret named from SSH_PRIVATE_KEY_SECRET_NAME env var
-    2. Fallback to SSH_PRIVATE_KEY environment variable
     
     Returns:
         The SSH private key

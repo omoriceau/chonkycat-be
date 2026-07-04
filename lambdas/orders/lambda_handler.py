@@ -10,10 +10,12 @@ The frontend should include its WebSocket connection_id in the request body
 so the Payment Lambda can push the result back directly.
 
 Environment Variables:
-  - DB_CLUSTER_ARN
-  - DB_SECRET_ARN
-  - DB_NAME
-  - EVENT_BUS_NAME     EventBridge bus name (default: chonkychonk-bus)
+  - DB_HOST              PostgreSQL RDS endpoint
+  - DB_PORT              PostgreSQL port (default: 5432)
+  - DB_USER              Database user
+  - DB_NAME              Database name
+  - DB_PASSWORD_SECRET_NAME  Name of AWS Secrets Manager secret for DB password
+  - EVENT_BUS_NAME       EventBridge bus name (default: chonkychonk-bus)
 
 Example request body:
 {
@@ -43,23 +45,22 @@ import json
 import logging
 import os
 
-from orders.models import ValidationError, parse_create_order_request
-from orders.service import OrderService
+from models import ValidationError, parse_create_order_request
+from service import OrderService
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
-DB_SECRET_ARN  = os.environ["DB_SECRET_ARN"]
-DB_NAME        = os.environ["DB_NAME"]
-
 # Module-level service — reused across warm invocations
-_service = OrderService(
-    db_cluster_arn=DB_CLUSTER_ARN,
-    db_secret_arn=DB_SECRET_ARN,
-    db_name=DB_NAME,
-)
+# Lazy-initialized to avoid runtime crash if DB connection fails on cold start
+_service = None
+
+def _get_service() -> OrderService:
+    global _service
+    if _service is None:
+        _service = OrderService()
+    return _service
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +105,7 @@ def lambda_handler(event: dict, context) -> dict:
 
     # Process
     try:
-        result = _service.create_order(request)
+        result = _get_service().create_order(request)
     except ValidationError as e:
         # Business rule violations (stock, invalid promo, etc.)
         return err(str(e), status=422)

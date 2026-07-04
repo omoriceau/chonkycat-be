@@ -14,7 +14,7 @@ version = 0.1
 # ============================================================
 [dev.deploy.parameters]
 stack_name        = "chonkychonk-dev"
-region            = "ca-central-1"
+region            = "us-east-1"
 confirm_changeset = false
 capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 s3_bucket         = "chonkychonk-sam-artifacts-dev"
@@ -25,7 +25,6 @@ parameter_overrides = [
   "DBHost=$DB_HOST",
   "DBPort=$DB_PORT",
   "DBUser=$DB_USER",
-  "DBPassword=$DB_PASSWORD",
   "DBName=chonkydb",
   "VpcId=$VPC_ID",
   "SubnetIds=$SUBNET_IDS",
@@ -39,68 +38,4 @@ parameter_overrides = [
   "DBPasswordSecretName=chonky/dev/db_pass",
   "StripeSecretKeySecretName=chonky/dev/stripe_secret_key",
   "SSHPrivateKeySecretName=chonky/dev/ssh_private_key",
-]
-
-# ============================================================
-# STAGING
-# ============================================================
-[staging.deploy.parameters]
-stack_name        = "chonkychonk-staging"
-region            = "ca-central-1"
-confirm_changeset = true
-capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-s3_bucket         = "chonkychonk-sam-artifacts-staging"
-resolve_s3        = false
-
-parameter_overrides = [
-  "Environment=staging",
-  "DBHost=$DB_HOST",
-  "DBPort=$DB_PORT",
-  "DBUser=$DB_USER",
-  "DBPassword=$DB_PASSWORD",
-  "DBName=chonkydb",
-  "VpcId=$VPC_ID",
-  "SubnetIds=$SUBNET_IDS",
-  "SecurityGroupId=$SECURITY_GROUP_ID",
-  "EventBusName=chonkychonk-bus",
-  "CognitoEnabled=false",
-  "CognitoUserPoolId=none",
-  "CognitoAppClientId=none",
-  "ApigwWsEndpoint=none",
-  "SnsOpsTopicArn=none",
-  "DBPasswordSecretName=chonky/staging/db_pass",
-  "StripeSecretKeySecretName=chonky/staging/stripe_secret_key",
-  "SSHPrivateKeySecretName=chonky/staging/ssh_private_key",
-]
-
-# ============================================================
-# PROD
-# ============================================================
-[prod.deploy.parameters]
-stack_name        = "chonkychonk-prod"
-region            = "ca-central-1"
-confirm_changeset = true    # always review the changeset before applying to prod
-capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-s3_bucket         = "chonkychonk-sam-artifacts-prod"
-resolve_s3        = false
-
-parameter_overrides = [
-  "Environment=prod",
-  "DBHost=$DB_HOST",
-  "DBPort=$DB_PORT",
-  "DBUser=$DB_USER",
-  "DBPassword=$DB_PASSWORD",
-  "DBName=chonkydb",
-  "VpcId=$VPC_ID",
-  "SubnetIds=$SUBNET_IDS",
-  "SecurityGroupId=$SECURITY_GROUP_ID",
-  "EventBusName=chonkychonk-bus",
-  "CognitoEnabled=true",
-  "CognitoUserPoolId=$COGNITO_USER_POOL_ID",
-  "CognitoAppClientId=$COGNITO_APP_CLIENT_ID",
-  "ApigwWsEndpoint=$APIGW_WS_ENDPOINT",
-  "SnsOpsTopicArn=$SNS_OPS_TOPIC_ARN",
-  "DBPasswordSecretName=chonky/prod/db_pass",
-  "StripeSecretKeySecretName=chonky/prod/stripe_secret_key",
-  "SSHPrivateKeySecretName=chonky/prod/ssh_private_key",
 ]

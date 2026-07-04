@@ -35,6 +35,7 @@ CREATE TABLE public.orders (
   shipping_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   total_amount DECIMAL(10,2) NOT NULL,
   customer_notes TEXT,
+  connection_id VARCHAR(255),
   shipping_name VARCHAR(255),
   shipping_address1 VARCHAR(255),
   shipping_address2 VARCHAR(255),
