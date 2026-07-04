@@ -135,3 +135,57 @@ def parse_create_order_request(data: dict) -> CreateOrderRequest:
         connection_id    = data.get("connection_id"),
         payment_provider = str(data.get("payment_provider", "stripe")),
     )
+
+
+def parse_update_order_request(data: dict) -> dict:
+    """
+    Parse optional fields for order updates.
+    Allows partial updates: items, shipping, customer_notes, or any combination.
+    Returns a dict with only the provided fields.
+    """
+    update = {}
+    
+    # Items (optional)
+    if "items" in data:
+        raw_items = data["items"]
+        if not isinstance(raw_items, list) or len(raw_items) == 0:
+            raise ValidationError("'items' must be a non-empty list")
+        
+        items = []
+        for i, item in enumerate(raw_items):
+            try:
+                product_id = int(_require(item, "product_id"))
+                quantity   = int(_require(item, "quantity"))
+            except (TypeError, ValueError) as e:
+                raise ValidationError(f"items[{i}]: {e}")
+            if quantity < 1:
+                raise ValidationError(f"items[{i}]: quantity must be >= 1")
+            items.append(OrderItemRequest(product_id=product_id, quantity=quantity))
+        update["items"] = items
+    
+    # Shipping (optional)
+    if "shipping" in data:
+        raw_shipping = data["shipping"]
+        shipping = ShippingAddress(
+            name        = str(_require(raw_shipping, "name")),
+            address1    = str(_require(raw_shipping, "address1")),
+            city        = str(_require(raw_shipping, "city")),
+            province    = str(_require(raw_shipping, "province")),
+            postal_code = str(_require(raw_shipping, "postal_code")),
+            country     = str(_require(raw_shipping, "country")),
+            address2    = raw_shipping.get("address2"),
+        )
+        update["shipping"] = shipping
+    
+    # Customer notes (optional)
+    if "customer_notes" in data:
+        update["customer_notes"] = data.get("customer_notes")
+    
+    # Promotion code (optional)
+    if "promotion_code" in data:
+        update["promotion_code"] = data.get("promotion_code")
+    
+    if not update:
+        raise ValidationError("At least one field must be provided for update (items, shipping, customer_notes, or promotion_code)")
+    
+    return update

@@ -45,7 +45,7 @@ import json
 import logging
 import os
 
-from models import ValidationError, parse_create_order_request
+from models import ValidationError, parse_create_order_request, parse_update_order_request
 from service import OrderService
 from botocore.exceptions import ClientError
 
@@ -158,7 +158,42 @@ def _handle_create_order(event: dict) -> dict:
 
 def _handle_update_order(event: dict) -> dict:
     """PUT /orders/{orderId}"""
-    return err("Update not yet implemented", status=501)
+    try:
+        order_id = int(event["pathParameters"]["orderId"])
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid orderId in path", status=400)
+
+    # Parse body
+    body = event.get("body", "{}")
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        return err("Request body is not valid JSON", status=400)
+
+    # Validate update fields
+    try:
+        update = parse_update_order_request(data)
+    except ValidationError as e:
+        return err(str(e), status=422)
+
+    # Process update
+    try:
+        result = _get_service().update_order(order_id, update)
+        if result is None:
+            return err("Order not found", status=404)
+        return ok({
+            "message": "Order updated successfully",
+            "order": result,
+        })
+    except ValidationError as e:
+        # Business rule violations (order status, stock, etc.)
+        return err(str(e), status=422)
+    except ClientError as e:
+        logger.exception("Infrastructure error updating order")
+        return err("Internal server error", status=500)
+    except Exception:
+        logger.exception("Unexpected error updating order")
+        return err("Internal server error", status=500)
 
 
 def _handle_delete_order(event: dict) -> dict:

@@ -29,6 +29,7 @@ from models import (
     CreateOrderRequest,
     ResolvedOrder,
     ResolvedOrderItem,
+    ShippingAddress,
     ValidationError,
 )
 
@@ -163,6 +164,209 @@ class OrderService:
         except Exception as e:
             logger.error("Failed to delete order %s: %s", order_id, e)
             raise
+
+    def update_order(self, order_id: int, update: dict) -> dict | None:
+        """
+        Update an order with new items, shipping, notes, or promotion code.
+        Only allows updates to pending orders (status='pending').
+        Recalculates totals if items or promotion changes.
+        Returns updated order dict, or None if order not found.
+        """
+        # 1. Fetch current order
+        current_order_sql = """
+            SELECT id, user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
+                   customer_notes, created_at,
+                   shipping_name, shipping_address1, shipping_address2,
+                   shipping_city, shipping_province, shipping_postal_code, shipping_country
+            FROM   orders
+            WHERE  id = $1 AND deleted_at IS NULL
+        """
+        resp = self._execute(
+            current_order_sql,
+            [{"name": "order_id", "value": {"longValue": order_id}}],
+            "fetch_order_for_update",
+            include_metadata=True,
+        )
+        
+        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
+        if not rows:
+            return None
+        
+        current = rows[0]
+        
+        # 2. Only allow updates to pending orders
+        if current["status"] != "pending":
+            raise ValidationError(f"Cannot update order with status '{current['status']}'")
+        
+        # 3. Resolve updated fields
+        items = update.get("items")
+        shipping = update.get("shipping")
+        customer_notes = update.get("customer_notes")
+        promotion_code = update.get("promotion_code")
+        
+        # If items changed, re-resolve and recalculate
+        if items is not None:
+            resolved_items = self._resolve_items(items)
+            subtotal = _cents(sum(i.line_total for i in resolved_items))
+        else:
+            # Fetch existing items
+            items_sql = """
+                SELECT product_id, quantity, unit_price, line_total, name_snapshot
+                FROM   order_items
+                WHERE  order_id = $1
+                ORDER BY id ASC
+            """
+            items_resp = self._execute(
+                items_sql,
+                [{"name": "order_id", "value": {"longValue": order_id}}],
+                "fetch_order_items_for_update",
+                include_metadata=True,
+            )
+            
+            items_data = self._to_dicts(items_resp["columnMetadata"], items_resp["records"])
+            resolved_items = [
+                ResolvedOrderItem(
+                    product_id=i["product_id"],
+                    name_snapshot=i["name_snapshot"],
+                    quantity=i["quantity"],
+                    unit_price=Decimal(str(i["unit_price"])),
+                    line_total=Decimal(str(i["line_total"])),
+                )
+                for i in items_data
+            ]
+            subtotal = Decimal(str(current["subtotal"]))
+        
+        # Resolve promotion
+        promotion_id, discount = self._resolve_promotion(promotion_code, resolved_items)
+        
+        # Calculate new totals
+        discounted_sub = _cents(max(Decimal("0"), subtotal - discount))
+        shipping_amount = Decimal("0") if discounted_sub >= FREE_SHIP_ABOVE else FLAT_SHIP_FEE
+        tax_amount = _cents(discounted_sub * TAX_RATE)
+        total_amount = _cents(discounted_sub + tax_amount + shipping_amount)
+        
+        # 4. Update order in DB
+        update_sql = """
+            UPDATE orders
+            SET    subtotal = $1,
+                   tax_amount = $2,
+                   shipping_amount = $3,
+                   total_amount = $4,
+                   customer_notes = $5,
+                   shipping_name = $6,
+                   shipping_address1 = $7,
+                   shipping_address2 = $8,
+                   shipping_city = $9,
+                   shipping_province = $10,
+                   shipping_postal_code = $11,
+                   shipping_country = $12,
+                   updated_at = CURRENT_TIMESTAMP
+            WHERE  id = $13
+        """
+        
+        shipping_obj = shipping or ShippingAddress(
+            name=current["shipping_name"],
+            address1=current["shipping_address1"],
+            city=current["shipping_city"],
+            province=current["shipping_province"],
+            postal_code=current["shipping_postal_code"],
+            country=current["shipping_country"],
+            address2=current["shipping_address2"],
+        )
+        
+        notes = customer_notes if customer_notes is not None else current["customer_notes"]
+        
+        self._execute(
+            update_sql,
+            [
+                {"name": "subtotal",      "value": {"stringValue": str(subtotal)}},
+                {"name": "tax",           "value": {"stringValue": str(tax_amount)}},
+                {"name": "shipping",      "value": {"stringValue": str(shipping_amount)}},
+                {"name": "total",         "value": {"stringValue": str(total_amount)}},
+                {"name": "notes",         "value": {"stringValue": notes or ""} if notes else {"isNull": True}},
+                {"name": "s_name",        "value": {"stringValue": shipping_obj.name}},
+                {"name": "s_addr1",       "value": {"stringValue": shipping_obj.address1}},
+                {"name": "s_addr2",       "value": {"stringValue": shipping_obj.address2 or ""} if shipping_obj.address2 else {"isNull": True}},
+                {"name": "s_city",        "value": {"stringValue": shipping_obj.city}},
+                {"name": "s_prov",        "value": {"stringValue": shipping_obj.province}},
+                {"name": "s_postal",      "value": {"stringValue": shipping_obj.postal_code}},
+                {"name": "s_country",     "value": {"stringValue": shipping_obj.country}},
+                {"name": "order_id",      "value": {"longValue": order_id}},
+            ],
+            "update_order",
+        )
+        
+        # 5. Update items if provided
+        if items is not None:
+            # Delete existing items
+            delete_items_sql = "DELETE FROM order_items WHERE order_id = $1"
+            self._execute(
+                delete_items_sql,
+                [{"name": "order_id", "value": {"longValue": order_id}}],
+                "delete_order_items",
+            )
+            
+            # Insert new items
+            for item in resolved_items:
+                item_sql = """
+                    INSERT INTO order_items
+                      (order_id, product_id, quantity, unit_price, line_total, name_snapshot)
+                    VALUES
+                      ($1, $2, $3, $4, $5, $6)
+                """
+                self._execute(item_sql, [
+                    {"name": "order_id",   "value": {"longValue": order_id}},
+                    {"name": "product_id", "value": {"longValue": item.product_id}},
+                    {"name": "qty",        "value": {"longValue": item.quantity}},
+                    {"name": "unit_price", "value": {"stringValue": str(item.unit_price)}},
+                    {"name": "line_total", "value": {"stringValue": str(item.line_total)}},
+                    {"name": "name",       "value": {"stringValue": item.name_snapshot}},
+                ], "insert_updated_order_item")
+        
+        # 6. Update promotion if provided
+        if promotion_code is not None:
+            # Delete existing promotion
+            delete_promo_sql = "DELETE FROM order_promotions WHERE order_id = $1"
+            self._execute(
+                delete_promo_sql,
+                [{"name": "order_id", "value": {"longValue": order_id}}],
+                "delete_order_promotion",
+            )
+            
+            # Insert new promotion
+            if promotion_id:
+                promo_sql = """
+                    INSERT INTO order_promotions (order_id, promotion_id, discount_amount)
+                    VALUES ($1, $2, $3)
+                """
+                self._execute(promo_sql, [
+                    {"name": "order_id",  "value": {"longValue": order_id}},
+                    {"name": "promo_id",  "value": {"longValue": promotion_id}},
+                    {"name": "discount",  "value": {"stringValue": str(discount)}},
+                ], "insert_updated_order_promotion")
+        
+        logger.info("Order updated | order_id=%s", order_id)
+        
+        # 7. Return updated order
+        return {
+            "order_id": order_id,
+            "status": "pending",
+            "subtotal": str(subtotal),
+            "discount": str(discount),
+            "tax": str(tax_amount),
+            "shipping": str(shipping_amount),
+            "total": str(total_amount),
+            "items": [
+                {
+                    "product_id": item.product_id,
+                    "name": item.name_snapshot,
+                    "quantity": item.quantity,
+                    "unit_price": str(item.unit_price),
+                    "line_total": str(item.line_total),
+                }
+                for item in resolved_items
+            ],
+        }
 
     def create_order(self, request: CreateOrderRequest) -> dict:
         """
