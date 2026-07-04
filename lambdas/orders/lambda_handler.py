@@ -90,6 +90,40 @@ def err(message: str, status: int = 400) -> dict:
 def lambda_handler(event: dict, context) -> dict:
     logger.info("Order request received")
 
+    method = event.get("httpMethod", "")
+    
+    # Route based on HTTP method
+    if method == "GET":
+        return _handle_get_order(event)
+    elif method == "POST":
+        return _handle_create_order(event)
+    elif method == "PUT":
+        return _handle_update_order(event)
+    elif method == "DELETE":
+        return _handle_delete_order(event)
+    else:
+        return err(f"Unsupported HTTP method: {method}", status=405)
+
+
+def _handle_get_order(event: dict) -> dict:
+    """GET /orders/{orderId}"""
+    try:
+        order_id = int(event["pathParameters"]["orderId"])
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid orderId in path", status=400)
+
+    try:
+        result = _get_service().get_order(order_id)
+        if result is None:
+            return err("Order not found", status=404)
+        return ok({"order": result})
+    except Exception:
+        logger.exception("Error retrieving order")
+        return err("Internal server error", status=500)
+
+
+def _handle_create_order(event: dict) -> dict:
+    """POST /orders"""
     # Parse body (API Gateway sends it as a string)
     body = event.get("body", "{}")
     try:
@@ -120,3 +154,13 @@ def lambda_handler(event: dict, context) -> dict:
         "message": "Order created. Payment is being processed.",
         "order":   result,
     }, status=201)
+
+
+def _handle_update_order(event: dict) -> dict:
+    """PUT /orders/{orderId}"""
+    return err("Update not yet implemented", status=501)
+
+
+def _handle_delete_order(event: dict) -> dict:
+    """DELETE /orders/{orderId}"""
+    return err("Delete not yet implemented", status=501)

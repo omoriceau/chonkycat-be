@@ -17,6 +17,7 @@ die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 ENVIRONMENT="${1:-dev}"
 REGION="${2:-us-east-1}"
+DEV_EMAIL="${3:-dev@example.com}"
 
 case "$ENVIRONMENT" in
   dev|staging|prod)
@@ -178,16 +179,19 @@ if [[ "$STACK_STATUS" == "UPDATE_ROLLBACK_FAILED" ]]; then
 fi
 
 # Build parameter overrides for all required parameters
-PARAM_OVERRIDES="ParameterKey=DBHost,ParameterValue=$DB_HOST \
-ParameterKey=DBPort,ParameterValue=$DB_PORT \
-ParameterKey=DBUser,ParameterValue=$DB_USER \
-ParameterKey=DBName,ParameterValue=$DB_NAME \
-ParameterKey=VpcId,ParameterValue=$VPC_ID \
-ParameterKey=SubnetIds,ParameterValue=$SUBNET_IDS \
-ParameterKey=SecurityGroupId,ParameterValue=$SECURITY_GROUP_ID \
-ParameterKey=DBPasswordSecretName,ParameterValue=chonky/${ENVIRONMENT}/db_pass \
-ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key \
-ParameterKey=SSHPrivateKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/ssh_private_key"
+PARAM_OVERRIDES=(
+  "ParameterKey=DBHost,ParameterValue=$DB_HOST"
+  "ParameterKey=DBPort,ParameterValue=$DB_PORT"
+  "ParameterKey=DBUser,ParameterValue=$DB_USER"
+  "ParameterKey=DBName,ParameterValue=$DB_NAME"
+  "ParameterKey=VpcId,ParameterValue=$VPC_ID"
+  "ParameterKey=SubnetIds,ParameterValue=$SUBNET_IDS"
+  "ParameterKey=SecurityGroupId,ParameterValue=$SECURITY_GROUP_ID"
+  "ParameterKey=DBPasswordSecretName,ParameterValue=chonky/${ENVIRONMENT}/db_pass"
+  "ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key"
+  "ParameterKey=SSHPrivateKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/ssh_private_key"
+  "ParameterKey=DevEmail,ParameterValue=$DEV_EMAIL"
+)
 
 sam deploy \
     --template-file .aws-sam/build/template.yaml \
@@ -196,7 +200,7 @@ sam deploy \
     --s3-bucket "$S3_BUCKET" \
     --capabilities CAPABILITY_IAM \
     --no-confirm-changeset \
-    --parameter-overrides $PARAM_OVERRIDES
+    --parameter-overrides "${PARAM_OVERRIDES[@]}"
 
 # ==============================================================================
 # Output

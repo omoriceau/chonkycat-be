@@ -23,6 +23,8 @@ Globals:
         DB_PASSWORD_SECRET_NAME:        !Ref DBPasswordSecretName
         STRIPE_SECRET_KEY_SECRET_NAME:  !Ref StripeSecretKeySecretName
         SSH_PRIVATE_KEY_SECRET_NAME:    !Ref SSHPrivateKeySecretName
+        ENVIRONMENT:                    !Ref Environment
+        DEV_EMAIL:                      !Ref DevEmail
 
 # ============================================================
 # Parameters — set per environment via samconfig.toml
@@ -108,6 +110,11 @@ Parameters:
     Type:    String
     Default: "chonky/dev/ssh_private_key"
     Description: Name of the Secrets Manager secret holding SSH_PRIVATE_KEY for schema loader
+
+  DevEmail:
+    Type:    String
+    Default: "dev@example.com"
+    Description: Email address for receiving test emails in SES Sandbox mode (dev environment)
 
 # ============================================================
 # Conditions
@@ -218,15 +225,15 @@ Resources:
                 - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StripeSecretKeySecretName}-*"
 
   # ----------------------------------------------------------
-  # Orders Email Lambda  —  sends confirmation/failure emails via SES
+  # Email Service Lambda  —  generic email handler for all events
   # ----------------------------------------------------------
-  OrdersEmailFunction:
+  EmailServiceFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub chonkychonk-orders-email-${Environment}
-      CodeUri:      lambdas/orders_email/
+      FunctionName: !Sub chonkychonk-email-service-${Environment}
+      CodeUri:      lambdas/email_service/
       Handler:      lambda_handler.lambda_handler
-      Description:  Sends order confirmation and failure emails via SES
+      Description:  Generic email service for sending emails triggered by EventBridge events
       # No VPC needed — only calls SES API
       Policies:
         - Version: '2012-10-17'
@@ -237,7 +244,7 @@ Resources:
                 - ses:SendRawEmail
               Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
       Events:
-        OrderCreatedEvent:
+        OrderEmailEvent:
           Type: EventBridgeRule
           Properties:
             EventBusName: !Ref EventBusName
@@ -247,6 +254,7 @@ Resources:
               detail-type:
                 - OrderCreated
                 - OrderFailure
+                - LowStockDetected
 
   # ----------------------------------------------------------
   # Orders Lambda  —  POST/GET/PUT/DELETE /orders (shopping cart)

@@ -64,6 +64,70 @@ class OrderService:
     # Public
     # ------------------------------------------------------------------
 
+    def get_order(self, order_id: int) -> dict | None:
+        """
+        Retrieve a single order by ID with all its items.
+        Returns a dict with order details and items, or None if not found.
+        """
+        sql = """
+            SELECT id, user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
+                   customer_notes, created_at,
+                   shipping_name, shipping_address1, shipping_address2,
+                   shipping_city, shipping_province, shipping_postal_code, shipping_country
+            FROM   orders
+            WHERE  id = $1
+        """
+        resp = self._execute(
+            sql,
+            [{"name": "order_id", "value": {"longValue": order_id}}],
+            "get_order",
+            include_metadata=True,
+        )
+        
+        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
+        if not rows:
+            return None
+        
+        order = rows[0]
+        
+        # Fetch order items
+        items_sql = """
+            SELECT product_id, quantity, unit_price, line_total, name_snapshot
+            FROM   order_items
+            WHERE  order_id = $1
+            ORDER BY id ASC
+        """
+        items_resp = self._execute(
+            items_sql,
+            [{"name": "order_id", "value": {"longValue": order_id}}],
+            "get_order_items",
+            include_metadata=True,
+        )
+        
+        items = self._to_dicts(items_resp["columnMetadata"], items_resp["records"])
+        
+        return {
+            "order_id": order["id"],
+            "user_id": order["user_id"],
+            "status": order["status"],
+            "subtotal": str(order["subtotal"]),
+            "tax": str(order["tax_amount"]),
+            "shipping_fee": str(order["shipping_amount"]),
+            "total": str(order["total_amount"]),
+            "customer_notes": order["customer_notes"],
+            "created_at": order["created_at"],
+            "shipping_address": {
+                "name": order["shipping_name"],
+                "address1": order["shipping_address1"],
+                "address2": order["shipping_address2"],
+                "city": order["shipping_city"],
+                "province": order["shipping_province"],
+                "postal_code": order["shipping_postal_code"],
+                "country": order["shipping_country"],
+            },
+            "items": items,
+        }
+
     def create_order(self, request: CreateOrderRequest) -> dict:
         """
         Full order creation flow.

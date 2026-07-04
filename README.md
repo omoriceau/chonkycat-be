@@ -59,6 +59,7 @@ For local development, the code falls back to environment variables if AWS Secre
 DB_PASSWORD=chonky_password
 STRIPE_SECRET_KEY=sk_test_...
 SSH_PRIVATE_KEY=$(cat ~/.ssh/chonky.pem)
+DEV_EMAIL="<for dev only - needs to be setup in AWS SES>"
 
 # Secret names (can also be overridden)
 DB_PASSWORD_SECRET_NAME=chonky/dev/db_pass
