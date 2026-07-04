@@ -163,4 +163,19 @@ def _handle_update_order(event: dict) -> dict:
 
 def _handle_delete_order(event: dict) -> dict:
     """DELETE /orders/{orderId}"""
-    return err("Delete not yet implemented", status=501)
+    try:
+        order_id = int(event["pathParameters"]["orderId"])
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid orderId in path", status=400)
+
+    try:
+        success = _get_service().delete_order(order_id)
+        if not success:
+            return err("Order not found", status=404)
+        return ok({
+            "message": "Order deleted successfully",
+            "order_id": order_id,
+        })
+    except Exception:
+        logger.exception("Error deleting order")
+        return err("Internal server error", status=500)

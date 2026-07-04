@@ -128,6 +128,42 @@ class OrderService:
             "items": items,
         }
 
+    def delete_order(self, order_id: int) -> bool:
+        """
+        Soft delete an order by setting deleted_at timestamp.
+        Returns True if successful, False if order not found.
+        """
+        # Check if order exists
+        check_sql = "SELECT id FROM orders WHERE id = $1 AND deleted_at IS NULL"
+        check_resp = self._execute(
+            check_sql,
+            [{"name": "order_id", "value": {"longValue": order_id}}],
+            "check_order_exists",
+            include_metadata=True,
+        )
+        
+        rows = self._to_dicts(check_resp["columnMetadata"], check_resp["records"])
+        if not rows:
+            return False
+        
+        # Soft delete
+        sql = """
+            UPDATE orders
+            SET deleted_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+        """
+        try:
+            self._execute(
+                sql,
+                [{"name": "order_id", "value": {"longValue": order_id}}],
+                "delete_order",
+            )
+            logger.info("Order soft deleted | order_id=%s", order_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to delete order %s: %s", order_id, e)
+            raise
+
     def create_order(self, request: CreateOrderRequest) -> dict:
         """
         Full order creation flow.
