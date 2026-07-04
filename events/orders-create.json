@@ -1,0 +1,33 @@
+{
+  "httpMethod": "POST",
+  "path": "/orders",
+  "headers": {
+    "X-User-Id": "1",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "user_id": 1,
+    "items": [
+      {
+        "product_id": 1,
+        "quantity": 2
+      },
+      {
+        "product_id": 2,
+        "quantity": 1
+      }
+    ],
+    "shipping_details": {
+      "name": "John Doe",
+      "address1": "123 Main St",
+      "address2": "Apt 4B",
+      "city": "Toronto",
+      "province": "ON",
+      "postal_code": "M5V 3A8",
+      "country": "Canada"
+    },
+    "customer_notes": "Please leave at door",
+    "tax_rate": 0.13,
+    "shipping_cost": 10.00
+  }
+}

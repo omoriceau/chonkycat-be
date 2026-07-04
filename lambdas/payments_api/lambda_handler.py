@@ -1,5 +1,23 @@
 """
 lambdas/payments_api/lambda_handler.py
+
+Entry point: POST /payments
+
+Accepts an existing order_id and creates a Stripe payment intent for it.
+
+Environment Variables:
+  - DB_HOST              PostgreSQL RDS endpoint
+  - DB_PORT              PostgreSQL port (default: 5432)
+  - DB_USER              Database user
+  - DB_NAME              Database name
+  - DB_PASSWORD_SECRET_NAME  Name of AWS Secrets Manager secret for DB password
+  - EVENT_BUS_NAME       EventBridge bus name (default: chonkychonk-bus)
+  - STRIPE_INTENT_FUNCTION_ARN  ARN of the Stripe Intent Lambda
+
+Example request body:
+{
+    "order_id": 123
+}
 """
 
 import json
@@ -28,22 +46,6 @@ _lambda = boto3.client("lambda", config=Config(
 ))
 
 
-def lambda_handler(event, context):
-    logger.info(">>>>event=%s", json.dumps(event, default=str))
-    try:
-        sts = boto3.client("sts")
-        result = sts.get_caller_identity()
-
-        return {
-            "statusCode": 200,
-            "body": str(result)
-        }
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": str(e)
-        }
-
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
@@ -71,161 +73,65 @@ def err(message: str, status: int = 400) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Cart validation
+# Order retrieval
 # ---------------------------------------------------------------------------
 
-def validate_cart(body: dict):
-    items = body.get("items")
+def get_order_with_items(db, order_id: int) -> dict:
+    """Fetch order and its items by order_id."""
+    logger.info("81 get_order_with_items: order_id=%s", order_id)
 
-    if not items or not isinstance(items, list):
-        raise ValueError("Cart is empty or invalid")
-
-    cleaned = []
-
-    for item in items:
-        product_id = item.get("product_id")
-        quantity = item.get("quantity")
-
-        if product_id is None:
-            raise ValueError("Missing product_id")
-
-        if quantity is None or int(quantity) <= 0:
-            raise ValueError(f"Invalid quantity for product {product_id}")
-
-        cleaned.append({
-            "product_id": int(product_id),
-            "quantity": int(quantity),
-        })
-
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Product / inventory layer
-# ---------------------------------------------------------------------------
-
-def load_products(product_ids):
-    if not product_ids:
-        return {}
-
-    logger.info("load_products: connecting to DB")
-    db = get_db_client()
-    logger.info("load_products: connected, querying product_ids=%s", product_ids)
-
-    rows = db.fetch_all(
+    # Fetch order
+    order = db.fetch_one(
         """
-        SELECT id, name, price, qty
-        FROM products
-        WHERE id = ANY(%s)
+        SELECT id, user_id, status, total_amount, subtotal, tax_amount, shipping_amount
+        FROM orders
+        WHERE id = %s AND deleted_at IS NULL
         """,
-        (product_ids,)
+        (order_id,)
     )
 
-    logger.info("load_products: got %d row(s)", len(rows))
+    if not order:
+        raise ValueError(f"Order {order_id} not found")
 
-    result = {}
-    for r in rows:
-        result[r["id"]] = {
-            "id": r["id"],
-            "name": r["name"],
-            "price": Decimal(str(r["price"])),
-            "qty": r["qty"],
-        }
+    logger.info("96 get_order_with_items: order found, fetching items")
 
-    return result
+    # Fetch order items
+    items = db.fetch_all(
+        """
+        SELECT product_id, quantity, unit_price, line_total, name_snapshot
+        FROM order_items
+        WHERE order_id = %s
+        """,
+        (order_id,)
+    )
+
+    logger.info("108 get_order_with_items: found %d item(s)", len(items))
+
+    return {
+        "order": order,
+        "items": items,
+    }
 
 
-def get_or_create_user(db, email: str) -> int:
-    logger.info("get_or_create_user: email=%s", email)
+def get_user_email(db, user_id: int) -> str:
+    """Fetch user email by user_id."""
+    logger.info("get_user_email: user_id=%s", user_id)
 
     row = db.fetch_one(
         """
-        INSERT INTO users (email)
-        VALUES (%s)
-        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-        RETURNING id
+        SELECT email
+        FROM users
+        WHERE id = %s
         """,
-        (email,)
+        (user_id,)
     )
 
     if not row:
-        raise Exception(f"Could not get or create user for email: {email}")
+        raise ValueError(f"User {user_id} not found")
 
-    logger.info("get_or_create_user: user_id=%s", row["id"])
-    return row["id"]
-
-
-def create_order_pending(items, total, email):
-    logger.info("create_order_pending: email=%s total=%s items=%s", email, total, items)
-
-    db = get_db_client()
-    logger.info("create_order_pending: DB connected")
-
-    user_id = get_or_create_user(db, email)
-
-    logger.info("create_order_pending: inserting order for user_id=%s", user_id)
-    order_row = db.fetch_one(
-        """
-        INSERT INTO orders (
-            user_id,
-            status,
-            subtotal,
-            tax_amount,
-            shipping_amount,
-            total_amount
-        )
-        VALUES (
-            %s,
-            'pending_payment',
-            %s,
-            0,
-            0,
-            %s
-        )
-        RETURNING id
-        """,
-        (user_id, total, total)
-    )
-
-    if not order_row:
-        raise Exception("Failed to create order")
-
-    order_id = order_row["id"]
-    logger.info("create_order_pending: order_id=%s", order_id)
-
-    for item in items:
-        logger.info("create_order_pending: inserting order_item product_id=%s qty=%s", item["product_id"], item["quantity"])
-        db.execute(
-            """
-            INSERT INTO order_items (
-                order_id,
-                product_id,
-                quantity,
-                unit_price,
-                line_total,
-                name_snapshot
-            )
-            SELECT
-                %s,
-                p.id,
-                %s,
-                p.price,
-                (p.price * %s),
-                p.name
-            FROM products p
-            WHERE p.id = %s
-            """,
-            (
-                order_id,
-                item["quantity"],
-                item["quantity"],
-                item["product_id"]
-            )
-        )
-        logger.info("create_order_pending: inserted order_item product_id=%s", item["product_id"])
-
-    logger.info("create_order_pending: done, returning order_id=%s", order_id)
-    return order_id
+    email = row["email"]
+    logger.info("get_user_email: email=%s", email)
+    return email
 
 
 # ---------------------------------------------------------------------------
@@ -299,43 +205,37 @@ def lambda_handler(event, context):
     logger.info("final body=%s", body)
 
     try:
-        logger.info("validating cart")
-        items = validate_cart(body)
+        # Extract order_id from request
+        order_id = body.get("order_id")
         currency = str(body.get("currency", "CAD")).lower()
-        email = body.get("customer_email", "")
-        logger.info("cart valid: items=%s currency=%s email=%s", items, currency, email)
 
-        product_ids = [i["product_id"] for i in items]
-        logger.info("loading products: product_ids=%s", product_ids)
-        products = load_products(product_ids)
-        logger.info("products loaded: %s", list(products.keys()))
+        if not order_id:
+            logger.warning("missing order_id")
+            return err("order_id is required", status=422)
 
-        total = Decimal("0")
+        try:
+            order_id = int(order_id)
+        except (ValueError, TypeError):
+            logger.warning("invalid order_id format: %s", order_id)
+            return err("order_id must be an integer", status=422)
 
-        for item in items:
-            pid = item["product_id"]
-            qty = item["quantity"]
+        logger.info("retrieving order: order_id=%s", order_id)
+        db = get_db_client()
+        order_data = get_order_with_items(db, order_id)
+        order = order_data["order"]
+        email = get_user_email(db, order["user_id"])
 
-            if pid not in products:
-                logger.warning("product not found: pid=%s", pid)
-                return err(f"Product not found: {pid}", 404)
+        logger.info("order retrieved: status=%s total_amount=%s", order["status"], order["total_amount"])
 
-            product = products[pid]
-            logger.info("product=%s qty_available=%s qty_requested=%s", product["name"], product["qty"], qty)
+        # Check order status
+        if order["status"] != "pending":
+            logger.warning("order not in pending status: status=%s", order["status"])
+            return err(f"Order is in {order['status']} status, cannot create payment intent", status=409)
 
-            if product["qty"] < qty:
-                logger.warning("insufficient inventory: product=%s available=%s requested=%s", product["name"], product["qty"], qty)
-                return err(f"Insufficient inventory for {product['name']}", 409)
+        total = Decimal(str(order["total_amount"]))
+        logger.info("order total: %s %s", total, currency)
 
-            total += product["price"] * qty
-
-        logger.info("total computed: %s %s", total, currency)
-
-        logger.info("creating order")
-        order_id = create_order_pending(items, total, email)
-        logger.info("order created: order_id=%s", order_id)
-
-        logger.info("before invoking StripeIntentFunction: amount=%s currency=%s order_id=%s", int(total * 100), currency, order_id)
+        logger.info("invoking StripeIntentFunction: amount=%s currency=%s order_id=%s", int(total * 100), currency, order_id)
         stripe_result = create_stripe_intent(
             amount=int(total * 100),
             currency=currency,
@@ -362,74 +262,4 @@ def lambda_handler(event, context):
 
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
-        return err("Internal server error", status=500)
-    logger.info("event=%s", json.dumps(event, default=str))
-
-    body = event.get("body", "")
-    if isinstance(body, str):
-        try:
-            body = json.loads(body)
-        except json.JSONDecodeError:
-            return err("Invalid JSON body")
-
-    try:
-        logger.info("validating cart")
-        items = validate_cart(body)
-        currency = str(body.get("currency", "CAD")).lower()
-        email = body.get("customer_email", "")
-        logger.info("cart valid: items=%s currency=%s email=%s", items, currency, email)
-
-        product_ids = [i["product_id"] for i in items]
-        logger.info("loading products: product_ids=%s", product_ids)
-        products = load_products(product_ids)
-        logger.info("products loaded: %s", list(products.keys()))
-
-        total = Decimal("0")
-
-        for item in items:
-            pid = item["product_id"]
-            qty = item["quantity"]
-
-            if pid not in products:
-                return err(f"Product not found: {pid}", 404)
-
-            product = products[pid]
-
-            if product["qty"] < qty:
-                return err(f"Insufficient inventory for {product['name']}", 409)
-
-            total += product["price"] * qty
-
-        logger.info("total computed: %s %s", total, currency)
-
-        logger.info("creating order")
-        order_id = create_order_pending(items, total, email)
-        logger.info("order created: order_id=%s", order_id)
-
-        logger.info("creating Stripe PaymentIntent: amount=%s currency=%s", int(total * 100), currency)
-        stripe_result = create_stripe_intent(
-            amount=int(total * 100),
-            currency=currency,
-            order_id=order_id,
-            email=email,
-        )
-        logger.info("Stripe PaymentIntent created: intent_id=%s", intent.id)
-
-        emit_event("PaymentIntentCreated", {
-            "order_id": order_id,
-            "amount": str(total),
-            "currency": currency,
-            "stripe_payment_intent": stripe_result["client_secret"]
-        })
-
-        return ok({
-            "order_id": order_id,
-            "client_secret": stripe_result["client_secret"]
-        }, status=200)
-
-    except ValueError as e:
-        return err(str(e), status=422)
-
-    except Exception as e:
-        logger.exception("Unhandled error")
         return err("Internal server error", status=500)

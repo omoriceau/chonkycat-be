@@ -1,0 +1,12 @@
+{
+  "httpMethod": "PUT",
+  "path": "/orders/6",
+  "pathParameters": {
+    "orderId": "6"
+  },
+  "headers": {
+    "X-User-Id": "1",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"items\": [{\"product_id\": 1, \"quantity\": 2}], \"customer_notes\": \"Updated notes\"}"
+}

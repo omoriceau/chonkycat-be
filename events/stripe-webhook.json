@@ -1,0 +1,6 @@
+{
+  "body": "{\"id\":\"evt_test123\",\"object\":\"event\",\"api_version\":\"2023-10-16\",\"created\":1688000000,\"data\":{\"object\":{\"id\":\"pi_test123\",\"object\":\"payment_intent\",\"amount\":5000,\"currency\":\"cad\",\"status\":\"succeeded\",\"metadata\":{\"order_id\":\"1\"},\"last_payment_error\":null}},\"livemode\":false,\"pending_webhooks\":1,\"request\":null,\"type\":\"payment_intent.succeeded\"}",
+  "headers": {
+    "stripe-signature": "t=1688000000,v1=test_signature"
+  }
+}

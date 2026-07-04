@@ -22,6 +22,7 @@ Globals:
         EVENT_BUS_NAME:                 !Ref EventBusName
         DB_PASSWORD_SECRET_NAME:        !Ref DBPasswordSecretName
         STRIPE_SECRET_KEY_SECRET_NAME:  !Ref StripeSecretKeySecretName
+        STRIPE_WEBHOOK_SECRET_NAME:     !Ref StripeWebhookSecretName
         SSH_PRIVATE_KEY_SECRET_NAME:    !Ref SSHPrivateKeySecretName
         ENVIRONMENT:                    !Ref Environment
         DEV_EMAIL:                      !Ref DevEmail
@@ -110,6 +111,11 @@ Parameters:
     Type:    String
     Default: "chonky/dev/ssh_private_key"
     Description: Name of the Secrets Manager secret holding SSH_PRIVATE_KEY for schema loader
+
+  StripeWebhookSecretName:
+    Type:    String
+    Default: "chonky/dev/stripe_webhook_secret"
+    Description: Name of the Secrets Manager secret holding STRIPE_WEBHOOK_SECRET
 
   DevEmail:
     Type:    String
@@ -401,6 +407,42 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /payments
             Method: POST
+
+  # ----------------------------------------------------------
+  # Stripe Webhook Lambda  —  listens for Stripe events
+  # ----------------------------------------------------------
+  StripeWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub chonkychonk-stripe-webhook-${Environment}
+      CodeUri:      lambdas/stripe_webhook/
+      Handler:      lambda_handler.lambda_handler
+      Description:  Receives Stripe webhook events and updates order status
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          STRIPE_WEBHOOK_SECRET_NAME: !Ref StripeWebhookSecretName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StripeWebhookSecretName}-*"
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBusName
+      Events:
+        StripeWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /webhook
+            Method: POST
   
 # ============================================================
 # Outputs — printed after every deploy, useful for wiring
@@ -423,6 +465,10 @@ Outputs:
     Description: Payments endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/payments"
 
+  WebhookApi:
+    Description: Stripe webhook endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/webhook"
+
   EventBusArn:
     Description: EventBridge bus ARN
     Value: !GetAtt ChonkyEventBus.Arn
@@ -442,3 +488,7 @@ Outputs:
   OrdersFunctionArn:
     Description: Orders Lambda ARN
     Value: !GetAtt OrdersFunction.Arn
+
+  StripeWebhookFunctionArn:
+    Description: Stripe Webhook Lambda ARN
+    Value: !GetAtt StripeWebhookFunction.Arn

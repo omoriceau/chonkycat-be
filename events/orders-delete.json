@@ -1,0 +1,10 @@
+{
+  "httpMethod": "DELETE",
+  "path": "/orders/6",
+  "pathParameters": {
+    "orderId": "6"
+  },
+  "headers": {
+    "X-User-Id": "1"
+  }
+}
