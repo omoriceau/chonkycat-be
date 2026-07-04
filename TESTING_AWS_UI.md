@@ -1461,6 +1461,109 @@ Replace `1` with your order_id.
 
 ---
 
+## Verifying Email Events (UserCreated → Welcome Email)
+
+When you create a new user via POST /users, the following flow happens:
+
+1. **Users Lambda** creates the user in the database
+2. **Users Lambda** publishes a `UserCreated` event to EventBridge
+3. **EventBridge** routes the event to the **Email Service Lambda**
+4. **Email Service Lambda** sends a welcome email via SES
+
+Here's how to verify each step:
+
+### Step 1: Check CloudWatch Logs for UserCreated Event Emission
+
+Go to: **CloudWatch → Logs → Log Groups → `/aws/lambda/chonkychonk-users-dev`**
+
+1. Click the latest log stream
+2. Search for: `EventBridge UserCreated emitted`
+3. Look for a log entry like:
+   ```
+   EventBridge UserCreated emitted | user_id=5
+   ```
+
+**If you see this:** ✓ The event was successfully published to EventBridge
+
+**If you don't see this:** ✗ The event wasn't published. Check if there were any errors in the Users Lambda logs.
+
+---
+
+### Step 2: Check EventBridge Event Delivery
+
+Go to: **EventBridge → Event Buses → chonkychonk-bus → Rules**
+
+1. Find the rule that matches UserCreated events (or look for the Email Service rule)
+2. Click the rule name
+3. Click **Monitoring** tab
+4. Look at **Invocations** graph — it should show a spike when you created the user
+
+**Alternative: Check DLQ (Dead-Letter Queue)**
+
+If events are failing, they may go to a DLQ:
+
+1. Go to **SQS → Queues**
+2. Look for a queue named `chonkychonk-email-service-dlq` or similar
+3. If there are messages, click **Send and Receive Messages** to inspect them
+
+---
+
+### Step 3: Check Email Service Lambda Execution
+
+Go to: **CloudWatch → Logs → Log Groups → `/aws/lambda/chonkychonk-email-service-dev`**
+
+1. Click the latest log stream (created after you made the user)
+2. Look for log entries like:
+   ```
+   Email handler triggered | event={"source": "chonkychonk.users", ...}
+   Handling UserCreated event | user_id=5
+   Welcome email sent | to=dev@example.com user_id=5 original=alice.wonder@example.com
+   ```
+
+**If you see "Welcome email sent":** ✓ The email was successfully sent to SES
+
+**If you see "Failed to send welcome email":** ✗ Check the error logs for SES-related issues
+
+---
+
+### Step 4: Check SES Sent Emails
+
+Go to: **SES → Account dashboard → Send Statistics**
+
+1. Check the "Bounces", "Complaints", and "Delivery" widgets
+2. Look for recent sends
+
+**Or, go to: SES → Email Addresses** (if in Sandbox mode)
+
+1. Find the email address in the Verified Identities list
+2. Check the box next to it
+3. A panel will appear showing recent activity
+
+---
+
+### Step 5: Check SES Verification & Sandbox Status
+
+**Important:** If you're in SES Sandbox mode, you can only send emails to verified addresses.
+
+Go to: **SES → Verified Identities**
+
+1. Check if your test email address is listed
+2. If not, you need to verify it first (AWS will send you a verification link)
+3. If you're in Sandbox mode, you'll also need to verify the sender email (usually your app's notification email)
+
+---
+
+### Quick Troubleshooting: Email Not Sent
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "UserCreated emitted" log exists but no email logs | Event not routed to Email Lambda | Check EventBridge rule pattern (should match `source=chonkychonk.users, detail-type=UserCreated`) |
+| "Failed to send welcome email" with SES error | Email address not verified | Go to SES → Verified Identities and verify the email address |
+| No logs at all | Event never reached EventBridge | Check Users Lambda returned successfully (status 201) and emitted event |
+| "Missing required fields" error | Event payload missing fields | Check Users Lambda emits `user_id`, `email`, `first_name`, `role` in the event detail |
+
+---
+
 ## Quick Checklist for AWS UI Testing
 
 ### Step 1: Setup (do once)

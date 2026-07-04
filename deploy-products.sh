@@ -141,6 +141,20 @@ if ! aws s3api head-bucket --bucket "$S3_BUCKET" --region "$REGION" 2>/dev/null;
         2>/dev/null || warn "Bucket may already exist, continuing..."
 fi
 
+# EventBridge bus — shared by orders, users, and any future services.
+# Lambdas fall back to this name via the EVENT_BUS_NAME env var default.
+EVENT_BUS_NAME="chonkychonk-bus"
+
+log "Checking EventBridge event bus: $EVENT_BUS_NAME"
+if ! aws events describe-event-bus --name "$EVENT_BUS_NAME" --region "$REGION" >/dev/null 2>&1; then
+    log "Creating EventBridge event bus: $EVENT_BUS_NAME"
+    aws events create-event-bus \
+        --name "$EVENT_BUS_NAME" \
+        --region "$REGION"
+else
+    log "Event bus $EVENT_BUS_NAME already exists"
+fi
+
 # ==============================================================================
 # Build
 # ==============================================================================
@@ -201,6 +215,69 @@ sam deploy \
     --capabilities CAPABILITY_IAM \
     --no-confirm-changeset \
     --parameter-overrides "${PARAM_OVERRIDES[@]}"
+
+# ==============================================================================
+# EventBridge: wire UserCreated events (from the users Lambda) to the
+# Email Lambda so new users get a welcome email.
+#
+# NOTE: this rule/target/permission is created imperatively via the CLI,
+# not through the SAM template — it will NOT show up in `sam deploy` diffs
+# and will NOT be cleaned up if the stack is deleted. If the users Lambda
+# ever moves into this same SAM template, move this block into the
+# template's Events property instead so CloudFormation tracks it.
+# ==============================================================================
+
+log "Wiring UserCreated -> Email Lambda EventBridge rule..."
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+
+# Assumes the email Lambda's logical resource ID in the SAM template is
+# "EmailServiceFunction" (matches the existing OrderCreated/etc. rule name).
+# Adjust --logical-resource-id below if yours differs.
+EMAIL_LAMBDA_NAME=$(aws cloudformation describe-stack-resources \
+    --stack-name "$STACK_NAME" \
+    --logical-resource-id EmailServiceFunction \
+    --region "$REGION" \
+    --query 'StackResources[0].PhysicalResourceId' \
+    --output text 2>/dev/null || echo "")
+
+if [ -z "$EMAIL_LAMBDA_NAME" ] || [ "$EMAIL_LAMBDA_NAME" = "None" ]; then
+    warn "Could not find EmailServiceFunction in stack $STACK_NAME — skipping UserCreated rule setup."
+    warn "Wire it up manually once you confirm the correct logical/physical resource name."
+else
+    EMAIL_LAMBDA_ARN=$(aws lambda get-function \
+        --function-name "$EMAIL_LAMBDA_NAME" \
+        --region "$REGION" \
+        --query 'Configuration.FunctionArn' \
+        --output text)
+
+    USERS_RULE_NAME="chonkychonk-users-${ENVIRONMENT}-EmailServiceFunctionUserCreated"
+
+    log "Creating/updating rule: $USERS_RULE_NAME"
+    aws events put-rule \
+        --name "$USERS_RULE_NAME" \
+        --event-bus-name "$EVENT_BUS_NAME" \
+        --event-pattern '{"source":["chonkychonk.users"],"detail-type":["UserCreated"]}' \
+        --region "$REGION" >/dev/null
+
+    log "Pointing rule at Email Lambda: $EMAIL_LAMBDA_ARN"
+    aws events put-targets \
+        --rule "$USERS_RULE_NAME" \
+        --event-bus-name "$EVENT_BUS_NAME" \
+        --region "$REGION" \
+        --targets "[{\"Id\":\"EmailServiceFunction\",\"Arn\":\"$EMAIL_LAMBDA_ARN\"}]" >/dev/null
+
+    log "Granting EventBridge permission to invoke Email Lambda"
+    aws lambda add-permission \
+        --function-name "$EMAIL_LAMBDA_NAME" \
+        --statement-id "AllowEventBridgeUsersInvoke" \
+        --action lambda:InvokeFunction \
+        --principal events.amazonaws.com \
+        --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/${USERS_RULE_NAME}" \
+        --region "$REGION" 2>/dev/null || warn "Permission statement may already exist, continuing..."
+
+    log "UserCreated -> Email Lambda rule configured: $USERS_RULE_NAME"
+fi
 
 # ==============================================================================
 # Output

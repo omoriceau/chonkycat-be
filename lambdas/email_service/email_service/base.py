@@ -47,6 +47,13 @@ class OrderFailureEmail:
     support_email: str
 
 
+@dataclass(frozen=True)
+class WelcomeEmail:
+    to:         EmailAddress
+    first_name: Optional[str]
+    role:       str = "customer"
+
+
 # ---------------------------------------------------------------------------
 # Interface
 # ---------------------------------------------------------------------------
@@ -60,6 +67,11 @@ class EmailProvider(ABC):
 
     @abstractmethod
     def send_order_failure(self, email: OrderFailureEmail) -> bool:
+        """Returns True on success. Must never raise."""
+        ...
+
+    @abstractmethod
+    def send_welcome_email(self, email: WelcomeEmail, subject_prefix: str = "") -> bool:
         """Returns True on success. Must never raise."""
         ...
 

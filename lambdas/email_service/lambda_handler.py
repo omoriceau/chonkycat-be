@@ -8,6 +8,7 @@ Currently supports:
 - OrderCreated (from orders service)
 - OrderFailure (from payments service)
 - LowStockDetected (from orders service)
+- UserCreated (from users service) — sends a welcome email
 
 Can be extended for other email types.
 
@@ -21,7 +22,7 @@ import logging
 import os
 
 from email_service.factory import DefaultEmailProviderFactory
-from email_service.base import OrderConfirmationEmail, OrderFailureEmail
+from email_service.base import EmailAddress, OrderConfirmationEmail, OrderFailureEmail, WelcomeEmail
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -71,7 +72,11 @@ def lambda_handler(event, context):
             elif detail_type == "LowStockDetected":
                 logger.info("Low stock detected | products=%s", len(detail.get("products", [])))
                 return {"statusCode": 200, "body": json.dumps({"message": "Low stock event received"})}
-        
+
+        elif source == "chonkychonk.users":
+            if detail_type == "UserCreated":
+                return handle_user_created(detail)
+
         logger.warning("Unknown event | source=%s detail_type=%s", source, detail_type)
         return {"statusCode": 400, "body": json.dumps({"error": "Unknown event type"})}
     
@@ -128,6 +133,45 @@ def handle_order_created(detail: dict) -> dict:
     
     except Exception as e:
         logger.exception("Error sending order confirmation email")
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+
+def handle_user_created(detail: dict) -> dict:
+    """Send welcome email to a newly created user."""
+    logger.info("Handling UserCreated event | user_id=%s", detail.get("user_id"))
+
+    try:
+        user_email = detail.get("email")
+        user_id = detail.get("user_id")
+
+        if not user_email or not user_id:
+            logger.warning("Missing required fields in UserCreated event")
+            return {"statusCode": 400, "body": json.dumps({"error": "Missing email or user_id"})}
+
+        first_name = detail.get("first_name")
+        role = detail.get("role", "customer")
+
+        # Get actual recipient email (may be redirected in dev mode)
+        email_to, subject_prefix = get_recipient_email(user_email, f"user {user_id}")
+
+        email = WelcomeEmail(
+            to=EmailAddress(address=email_to, name=first_name),
+            first_name=first_name,
+            role=role,
+        )
+
+        provider = DefaultEmailProviderFactory().get_provider("ses")
+        success = provider.send_welcome_email(email, subject_prefix=subject_prefix)
+
+        if success:
+            logger.info("Welcome email sent | to=%s user_id=%s original=%s", email_to, user_id, user_email)
+            return {"statusCode": 200, "body": json.dumps({"message": "Email sent", "user_id": user_id, "sent_to": email_to})}
+        else:
+            logger.error("Failed to send welcome email | user_id=%s", user_id)
+            return {"statusCode": 500, "body": json.dumps({"error": "Failed to send email"})}
+
+    except Exception as e:
+        logger.exception("Error sending welcome email")
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
 

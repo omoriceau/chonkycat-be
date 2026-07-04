@@ -18,10 +18,11 @@ from textwrap import dedent
 import boto3
 from botocore.exceptions import ClientError
 
-from orders.email.base import (
+from email_service.base import (
     EmailProvider,
     OrderConfirmationEmail,
     OrderFailureEmail,
+    WelcomeEmail,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,12 @@ class SESEmailProvider(EmailProvider):
         subject  = f"There was a problem with your ChonkyChonk order #{email.order_id}"
         html     = self._render_failure_html(email)
         text     = self._render_failure_text(email)
+        return self._send(email.to.formatted(), subject, html, text)
+
+    def send_welcome_email(self, email: WelcomeEmail, subject_prefix: str = "") -> bool:
+        subject  = subject_prefix + "Welcome to ChonkyChonk! 🐾"
+        html     = self._render_welcome_html(email)
+        text     = self._render_welcome_text(email)
         return self._send(email.to.formatted(), subject, html, text)
 
     # ------------------------------------------------------------------
@@ -199,6 +206,51 @@ class SESEmailProvider(EmailProvider):
         </html>
         """
 
+    def _render_welcome_html(self, e: WelcomeEmail) -> str:
+        greeting_name = e.first_name or "there"
+        return f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+        <body style="margin:0;padding:0;background:#fdf7f0;font-family:Georgia,serif;color:#3a2e24">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td align="center" style="padding:32px 16px">
+              <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
+
+                <!-- Header -->
+                <tr><td style="background:#c97d3e;padding:32px;text-align:center">
+                  <h1 style="margin:0;color:#fff;font-size:28px;letter-spacing:1px">ChonkyChonk 🐾</h1>
+                  <p style="margin:8px 0 0;color:#ffe8cc;font-size:15px">Welcome to the family!</p>
+                </td></tr>
+
+                <!-- Body -->
+                <tr><td style="padding:32px">
+                  <p style="margin:0 0 16px;font-size:16px">
+                    Hi {greeting_name}, thanks for joining ChonkyChonk! Your account is all set up
+                    and ready to go.
+                  </p>
+                  <p style="margin:0 0 16px;font-size:14px;color:#666">
+                    Browse our treats, place an order, and we'll take care of the rest — chonky
+                    tails wagging guaranteed.
+                  </p>
+                  <p style="margin:0;font-size:13px;color:#888">
+                    Questions? Reply to this email or contact us at
+                    <a href="mailto:{SUPPORT_EMAIL}" style="color:#c97d3e">{SUPPORT_EMAIL}</a>.
+                  </p>
+                </td></tr>
+
+                <!-- Footer -->
+                <tr><td style="background:#fdf7f0;padding:20px;text-align:center;font-size:12px;color:#aaa">
+                  © ChonkyChonk — premium fuel for the discerning chonk
+                </td></tr>
+
+              </table>
+            </td></tr>
+          </table>
+        </body>
+        </html>
+        """
+
     # ------------------------------------------------------------------
     # Plain-text fallbacks
     # ------------------------------------------------------------------
@@ -224,6 +276,20 @@ class SESEmailProvider(EmailProvider):
             Tax:       ${e.tax} {e.currency}
             Shipping:  ${e.shipping_fee} {e.currency}
             Total:     ${e.total_amount} {e.currency}
+
+            Questions? Contact {SUPPORT_EMAIL}
+
+            © ChonkyChonk
+        """)
+
+    def _render_welcome_text(self, e: WelcomeEmail) -> str:
+        greeting_name = e.first_name or "there"
+        return dedent(f"""\
+            ChonkyChonk — Welcome!
+
+            Hi {greeting_name},
+
+            Thanks for joining ChonkyChonk! Your account is all set up and ready to go.
 
             Questions? Contact {SUPPORT_EMAIL}
 

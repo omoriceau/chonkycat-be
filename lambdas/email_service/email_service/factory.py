@@ -8,8 +8,8 @@ To add SendGrid:
   2. Add it to _REGISTRY below
 """
 
-from orders.email.base import EmailProvider, EmailProviderFactory
-from orders.email.ses_provider import SESEmailProvider
+from email_service.base import EmailProvider, EmailProviderFactory
+from email_service.ses_provider import SESEmailProvider
 
 
 class DefaultEmailProviderFactory(EmailProviderFactory):
