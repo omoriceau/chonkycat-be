@@ -15,15 +15,9 @@ Globals:
       - !Ref SharedLayer
     Environment:
       Variables:
-        DB_HOST:                        !Sub "${DBHost}"
-        DB_PORT:                        !Sub "${DBPort}"
-        DB_USER:                        !Sub "${DBUser}"
-        DB_NAME:                        !Ref DBName
         EVENT_BUS_NAME:                 !Ref EventBusName
-        DB_PASSWORD_SECRET_NAME:        !Ref DBPasswordSecretName
         STRIPE_SECRET_KEY_SECRET_NAME:  !Ref StripeSecretKeySecretName
         STRIPE_WEBHOOK_SECRET_NAME:     !Ref StripeWebhookSecretName
-        SSH_PRIVATE_KEY_SECRET_NAME:    !Ref SSHPrivateKeySecretName
         ENVIRONMENT:                    !Ref Environment
         DEV_EMAIL:                      !Ref DevEmail
 
@@ -35,35 +29,6 @@ Parameters:
     Type:    String
     Default: dev
     AllowedValues: [dev]
-
-  DBName:
-    Type:    String
-    Default: chonky
-
-  DBHost:
-    Type:    String
-    Description: PostgreSQL RDS endpoint
-
-  DBPort:
-    Type:    String
-    Default: "5432"
-    Description: PostgreSQL port
-
-  DBUser:
-    Type:    String
-    Description: Database user
-
-  VpcId:
-    Type:        AWS::EC2::VPC::Id
-    Description: VPC ID where RDS is deployed
-
-  SubnetIds:
-    Type:        List<AWS::EC2::Subnet::Id>
-    Description: Private subnet IDs for Lambda execution (must be in same VPC as RDS)
-
-  SecurityGroupId:
-    Type:        AWS::EC2::SecurityGroup::Id
-    Description: Security group ID for Lambda (must allow egress to RDS security group)
 
   EventBusName:
     Type:    String
@@ -97,20 +62,10 @@ Parameters:
     Default:     ""
     Description: ARN of the Secrets Manager secret holding STRIPE_SECRET_KEY
 
-  DBPasswordSecretName:
-    Type:    String
-    Default: "chonky/dev/db_pass"
-    Description: Name of the Secrets Manager secret holding DB_PASSWORD
-
   StripeSecretKeySecretName:
     Type:    String
     Default: "chonky/dev/stripe_secret_key"
     Description: Name of the Secrets Manager secret holding STRIPE_SECRET_KEY
-
-  SSHPrivateKeySecretName:
-    Type:    String
-    Default: "chonky/dev/ssh_private_key"
-    Description: Name of the Secrets Manager secret holding SSH_PRIVATE_KEY for schema loader
 
   StripeWebhookSecretName:
     Type:    String
@@ -121,6 +76,38 @@ Parameters:
     Type:    String
     Default: "dev@example.com"
     Description: Email address for receiving test emails in SES Sandbox mode (dev environment)
+
+  # ----------------------------------------------------------
+  # DynamoDB table names — Products, Orders, and Users read
+  # these now. Payments/Promotions are listed too since Orders
+  # already depends on Promotions, and Payments/StripeWebhook
+  # will need PaymentsTableName once they're migrated (the env
+  # var is wired up on them below already, ahead of that code
+  # change, so no further template edits are needed then).
+  #
+  # No defaults on purpose — deploy.sh passes these explicitly,
+  # built from the same name_prefix/env convention terraform
+  # uses for the tables themselves.
+  # ----------------------------------------------------------
+  UsersTableName:
+    Type:        String
+    Description: DynamoDB table name for users (aws_dynamodb_table.users)
+
+  ProductsTableName:
+    Type:        String
+    Description: DynamoDB table name for products (aws_dynamodb_table.products)
+
+  OrdersTableName:
+    Type:        String
+    Description: DynamoDB table name for orders (aws_dynamodb_table.orders)
+
+  PaymentsTableName:
+    Type:        String
+    Description: DynamoDB table name for payments (aws_dynamodb_table.payments)
+
+  PromotionsTableName:
+    Type:        String
+    Description: DynamoDB table name for promotions (aws_dynamodb_table.promotions)
 
 # ============================================================
 # Conditions
@@ -167,15 +154,16 @@ Resources:
       BuildMethod: python3.13
 
   # ----------------------------------------------------------
-  # EventBridge bus
+  # EventBridge bus — created imperatively by deploy-products.sh
+  # (aws events create-event-bus) before this stack deploys, so it
+  # is NOT declared here. Declaring it as a stack resource fails
+  # CloudFormation's early-validation ResourceExistenceCheck once
+  # the bus already exists outside the stack.
   # ----------------------------------------------------------
-  ChonkyEventBus:
-    Type: AWS::Events::EventBus
-    Properties:
-      Name: !Ref EventBusName
 
   # ----------------------------------------------------------
   # Products Lambda  —  GET /products and GET /products/{productid}
+  # DynamoDB, no VPC.
   # ----------------------------------------------------------
   ProductsFunction:
     Type: AWS::Serverless::Function
@@ -184,18 +172,12 @@ Resources:
       CodeUri:      lambdas/products/
       Handler:      lambda_handler.lambda_handler
       Description:  GET /products and GET /products/{productid}
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref SecurityGroupId
-        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          PRODUCTS_TABLE_NAME: !Ref ProductsTableName
       Policies:
-        - Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource:
-                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTableName
       Events:
         GetProducts:
           Type: Api
@@ -266,6 +248,8 @@ Resources:
 
   # ----------------------------------------------------------
   # Orders Lambda  —  POST/GET/PUT/DELETE /orders (shopping cart)
+  # DynamoDB, no VPC. Touches orders + products (stock decrement,
+  # reorder_flag maintenance) + promotions (read-only).
   # ----------------------------------------------------------
   OrdersFunction:
     Type: AWS::Serverless::Function
@@ -274,18 +258,29 @@ Resources:
       CodeUri:      lambdas/orders/
       Handler:      lambda_handler.lambda_handler
       Description:  Shopping cart CRUD - POST/GET/PUT/DELETE /orders
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref SecurityGroupId
-        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME:     !Ref OrdersTableName
+          PRODUCTS_TABLE_NAME:   !Ref ProductsTableName
+          PROMOTIONS_TABLE_NAME: !Ref PromotionsTableName
       Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProductsTableName
+        - DynamoDBReadPolicy:
+            TableName: !Ref PromotionsTableName
+        # DynamoDBCrudPolicy doesn't include TransactWriteItems —
+        # order creation/update uses it (order + items + stock
+        # decrement as one atomic write), so it's granted explicitly.
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
+                - dynamodb:TransactWriteItems
               Resource:
-                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProductsTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
       Events:
@@ -316,6 +311,7 @@ Resources:
 
   # ----------------------------------------------------------
   # Users Lambda  —  POST/GET/PUT/DELETE /users (user management)
+  # DynamoDB, no VPC.
   # ----------------------------------------------------------
   UsersFunction:
     Type: AWS::Serverless::Function
@@ -324,18 +320,22 @@ Resources:
       CodeUri:      lambdas/users/
       Handler:      lambda_handler.lambda_handler
       Description:  User CRUD - POST/GET/PUT/DELETE /users
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref SecurityGroupId
-        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          USERS_TABLE_NAME: !Ref UsersTableName
       Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTableName
+        # Needed for the email-uniqueness lock-item pattern (create/update
+        # write the user + its email lock atomically). Not covered by
+        # DynamoDBCrudPolicy.
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
+                - dynamodb:TransactWriteItems
               Resource:
-                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
       Events:
@@ -372,8 +372,12 @@ Resources:
 
   # ----------------------------------------------------------
   # Payments Lambda  —  charge / refund via EventBridge
+  #
+  # NOT YET MIGRATED (code still assumes Postgres) — but RDS itself has
+  # been decommissioned, so there is nothing left to connect to. This
+  # function's code needs to move to DynamoDB before it will work again;
+  # the table env vars/policies below are already in place for that.
   # ----------------------------------------------------------
-  # Update PaymentsApiFunction to pass StripeIntentFunction ARN and allow invoke
   PaymentsApiFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -381,21 +385,24 @@ Resources:
       CodeUri:      lambdas/payments_api/
       Handler:      lambda_handler.lambda_handler
       Description:  Accepts POST /payments, creates orders, invokes StripeIntentFunction
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref SecurityGroupId
-        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           STRIPE_INTENT_FUNCTION_ARN: !GetAtt StripeIntentFunction.Arn
+          PAYMENTS_TABLE_NAME:        !Ref PaymentsTableName
+          ORDERS_TABLE_NAME:          !Ref OrdersTableName
       Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTableName
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
+                - dynamodb:TransactWriteItems
               Resource:
-                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${PaymentsTableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
         - LambdaInvokePolicy:
@@ -410,6 +417,11 @@ Resources:
 
   # ----------------------------------------------------------
   # Stripe Webhook Lambda  —  listens for Stripe events
+  #
+  # NOT YET MIGRATED (code still assumes Postgres) — but RDS itself has
+  # been decommissioned, so there is nothing left to connect to. This
+  # function's code needs to move to DynamoDB before it will work again;
+  # the table env vars/policies below are already in place for that.
   # ----------------------------------------------------------
   StripeWebhookFunction:
     Type: AWS::Serverless::Function
@@ -418,13 +430,11 @@ Resources:
       CodeUri:      lambdas/stripe_webhook/
       Handler:      lambda_handler.lambda_handler
       Description:  Receives Stripe webhook events and updates order status
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref SecurityGroupId
-        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           STRIPE_WEBHOOK_SECRET_NAME: !Ref StripeWebhookSecretName
+          PAYMENTS_TABLE_NAME:        !Ref PaymentsTableName
+          ORDERS_TABLE_NAME:          !Ref OrdersTableName
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -432,8 +442,19 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource:
-                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretName}-*"
                 - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StripeWebhookSecretName}-*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTableName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${PaymentsTableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
       Events:
@@ -471,7 +492,7 @@ Outputs:
 
   EventBusArn:
     Description: EventBridge bus ARN
-    Value: !GetAtt ChonkyEventBus.Arn
+    Value: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}"
 
   StripeIntentFunctionArn:
     Description: Stripe Intent Lambda ARN

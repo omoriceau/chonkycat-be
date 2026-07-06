@@ -1,180 +1,297 @@
 """
-Database helper for local and AWS RDS PostgreSQL.
-Uses psycopg2 to connect directly to PostgreSQL.
-Retrieves credentials from AWS Secrets Manager or environment variables.
+DynamoDB helper for the orders Lambda.
+
+Replaces the old psycopg2/RDS client entirely — auth is via the Lambda's
+execution role (IAM). This lambda touches THREE tables:
+
+  orders      (aws_dynamodb_table.orders)      — read/write
+  products    (aws_dynamodb_table.products)    — read (stock check) + write (decrement on order)
+  promotions  (aws_dynamodb_table.promotions)  — read only
+
+ORDERS TABLE — single-table layout (see terraform comments)
+  hash_key: order_id (S)   range_key: sk (S)
+    sk = "ORDER"          -> main order record (subtotal/tax/shipping/total,
+                             shipping address, status, applied_promotions list)
+    sk = "ITEM#<0001..>"  -> order line items (product_id, qty, unit_price, ...)
+    sk = "TRACKING#<ts>"  -> written by some other (fulfillment) lambda, not
+                             this one — get_order_with_children() still
+                             returns them if present, for forward-compat.
+  GSIs UserOrdersIndex / StatusIndex are sparse: only the "ORDER" sk item
+  carries user_id/status/created_at, so children never appear in them.
+
+STOCK DECREMENT — IMPORTANT
+----------------------------
+The original Postgres code never issued an `UPDATE products SET qty = ...`
+anywhere in Python — grepping the whole codebase turns up no decrement at
+all. That almost certainly means stock was decremented by a DB trigger on
+`order_items` INSERT that lived in the Postgres schema/migrations, which
+weren't included in what was shared with me. DynamoDB has no equivalent
+trigger mechanism, so `create_order_transaction` below decrements stock
+explicitly, conditioned on sufficient stock being available
+(`qty >= :requested`), as part of the same transaction that creates the
+order. If the original trigger did anything more elaborate than a plain
+decrement, that behavior needs to be ported in here too.
 """
 
 import os
-import sys
-import psycopg2
-import psycopg2.extras
-from typing import Any
+from decimal import Decimal
 
-from secrets import get_db_password
+import boto3
+from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
+
+_serializer = TypeSerializer()
 
 
-class PostgreSQLClient:
-    """Wrapper to provide RDS Data API-like interface using direct PostgreSQL connection."""
+def _to_dynamo(item: dict) -> dict:
+    return {k: _serializer.serialize(v) for k, v in item.items()}
+
+
+class InsufficientStock(Exception):
+    def __init__(self, product_id):
+        self.product_id = product_id
+        super().__init__(f"Insufficient stock for product {product_id}")
+
+
+class OrderNotFound(Exception):
+    pass
+
+
+class DynamoDBClient:
 
     def __init__(self):
-        self.connection = None
-        self._connect()
+        self.orders_table_name = os.environ.get("ORDERS_TABLE_NAME")
+        self.products_table_name = os.environ.get("PRODUCTS_TABLE_NAME")
+        self.promotions_table_name = os.environ.get("PROMOTIONS_TABLE_NAME")
 
-    def _connect(self):
-        """Connect to PostgreSQL database using environment variables and AWS Secrets Manager."""
-        # Environment variables MUST be set by Lambda configuration
-        db_host = os.environ.get("DB_HOST")
-        db_port_str = os.environ.get("DB_PORT")
-        db_user = os.environ.get("DB_USER")
-        db_name = os.environ.get("DB_NAME")
-
-        # Validate required connection parameters
-        missing_vars = []
-        if not db_host:
-            missing_vars.append("DB_HOST")
-        if not db_port_str:
-            missing_vars.append("DB_PORT")
-        if not db_user:
-            missing_vars.append("DB_USER")
-        if not db_name:
-            missing_vars.append("DB_NAME")
-
-        if missing_vars:
+        missing = [
+            name for name, val in (
+                ("ORDERS_TABLE_NAME", self.orders_table_name),
+                ("PRODUCTS_TABLE_NAME", self.products_table_name),
+                ("PROMOTIONS_TABLE_NAME", self.promotions_table_name),
+            ) if not val
+        ]
+        if missing:
             raise RuntimeError(
-                f"Missing required environment variables: {', '.join(missing_vars)}. "
-                f"Ensure the Lambda function is configured with these environment variables via SAM template or AWS console."
+                f"Missing required environment variable(s): {', '.join(missing)}. "
+                f"Set these to the table names output by terraform."
             )
 
-        # Retrieve password from AWS Secrets Manager (with fallback to env var)
-        db_password = get_db_password()
+        region = os.environ.get("AWS_REGION")
+        self._resource = boto3.resource("dynamodb", region_name=region)
+        self._client = self._resource.meta.client  # low-level client for transactions
 
-        db_port = int(db_port_str)
+        self.orders_table = self._resource.Table(self.orders_table_name)
+        self.products_table = self._resource.Table(self.products_table_name)
+        self.promotions_table = self._resource.Table(self.promotions_table_name)
 
-        print(f"[DB] Connecting to {db_host}:{db_port} db={db_name} user={db_user}")
-        self.connection = psycopg2.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            connect_timeout=5,
+    # ------------------------------------------------------------------
+    # Orders — reads
+    # ------------------------------------------------------------------
+
+    def get_order_with_children(self, order_id: str) -> dict | None:
+        """
+        One Query against the orders table returns the ORDER record plus
+        every ITEM# / TRACKING# child in a single round trip.
+        Returns None if there's no ORDER record for this order_id.
+        """
+        resp = self.orders_table.query(
+            KeyConditionExpression=Key("order_id").eq(order_id)
         )
-        self.connection.autocommit = True
-        print(f"[DB] Connected.")
+        rows = resp.get("Items", [])
+        order = next((r for r in rows if r["sk"] == "ORDER"), None)
+        if order is None:
+            return None
 
-    def _ensure_connected(self):
-        """Reconnect if the connection was dropped between Lambda invocations."""
-        try:
-            self.connection.cursor().execute("SELECT 1")
-        except Exception:
-            print("[DB] Connection lost — reconnecting...")
-            self._connect()
+        items = sorted((r for r in rows if r["sk"].startswith("ITEM#")), key=lambda r: r["sk"])
+        tracking = sorted((r for r in rows if r["sk"].startswith("TRACKING#")), key=lambda r: r["sk"])
+        return {"order": order, "items": items, "tracking": tracking}
 
-    def execute_statement(
+    # ------------------------------------------------------------------
+    # Orders — writes
+    # ------------------------------------------------------------------
+
+    def create_order_transaction(
         self,
-        sql: str = "",
-        parameters: list = None,
-        includeResultMetadata: bool = False,
-        # Accept (and ignore) Aurora Data API args so call sites don't need changing
-        resourceArn: str = "",
-        secretArn: str = "",
-        database: str = "",
-        **kwargs,
-    ) -> dict:
+        order_item: dict,
+        item_children: list[dict],
+        stock_decrements: list[dict],
+    ) -> None:
         """
-        Execute SQL and return results in RDS Data API format.
+        Atomically: Put the ORDER item, Put every ITEM# child, and decrement
+        stock on every ordered product (conditioned on enough stock being
+        available). All-or-nothing — if any product no longer has enough
+        stock (e.g. a race with another order), the whole order is rolled
+        back and nothing is written.
 
-        Parameters must use $1, $2 ... placeholders (PostgreSQL native style).
-        The `parameters` list is ordered — names are ignored, only values matter.
+        stock_decrements: [{"product_id": str, "quantity": int}, ...]
         """
-        if parameters is None:
-            parameters = []
-
-        self._ensure_connected()
-
-        # Extract ordered values from the RDS-style parameter list.
-        # The lambda builds params in the same order as the $1/$2 placeholders.
-        param_values = [self._extract_value(p["value"]) for p in parameters]
-
-        # psycopg2 uses %s placeholders — replace $1, $2, ... with %s in order.
-        import re
-        sql_formatted = re.sub(r"\$\d+", "%s", sql)
-
-        print(f"[DB] SQL: {sql_formatted.strip()[:200]}")
-        print(f"[DB] Params ({len(param_values)}): {param_values}")
+        transact_items = [
+            {
+                "Put": {
+                    "TableName": self.orders_table_name,
+                    "Item": _to_dynamo(order_item),
+                    "ConditionExpression": "attribute_not_exists(order_id)",
+                }
+            }
+        ]
+        for child in item_children:
+            transact_items.append({
+                "Put": {
+                    "TableName": self.orders_table_name,
+                    "Item": _to_dynamo(child),
+                }
+            })
+        for dec in stock_decrements:
+            transact_items.append({
+                "Update": {
+                    "TableName": self.products_table_name,
+                    "Key": _to_dynamo({"product_id": dec["product_id"]}),
+                    "UpdateExpression": "SET qty = qty - :q",
+                    "ConditionExpression": "qty >= :q",
+                    "ExpressionAttributeValues": _to_dynamo({":q": dec["quantity"]}),
+                }
+            })
 
         try:
-            with self.connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            ) as cursor:
-                cursor.execute(sql_formatted, param_values)
-                
-                # For INSERT/UPDATE/DELETE with RETURNING, fetch results
-                if cursor.description:
-                    rows = cursor.fetchall()
-                else:
-                    rows = []
-                
-                description = cursor.description
-        except Exception as e:
-            print(f"[DB] Query error: {e}")
+            self._client.transact_write_items(TransactItems=transact_items)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "TransactionCanceledException":
+                # We can't cheaply tell *which* product failed from the
+                # cancellation reasons without matching them positionally;
+                # the caller already validated stock right before this call,
+                # so this only fires on a genuine race — surface it generically.
+                raise InsufficientStock("one or more ordered products") from e
             raise
 
-        # For INSERT statements with RETURNING clause, extract the generated ID
-        response = self._format_response(rows, description, includeResultMetadata)
-        
-        # If this was an INSERT and we got back an id, format it as generatedFields
-        if rows and "id" in rows[0]:
-            response["generatedFields"] = [{"longValue": rows[0]["id"]}]
-        
-        return response
+    def soft_delete_order(self, order_id: str) -> bool:
+        """Set deleted_at on the ORDER item. Returns False if not found or already deleted."""
+        try:
+            self.orders_table.update_item(
+                Key={"order_id": order_id, "sk": "ORDER"},
+                UpdateExpression="SET deleted_at = :now",
+                ConditionExpression="attribute_exists(order_id) AND attribute_not_exists(deleted_at)",
+                ExpressionAttributeValues={":now": _now_iso()},
+            )
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False
+            raise
 
-    @staticmethod
-    def _extract_value(value_dict: dict) -> Any:
-        """Extract the actual value from RDS parameter format."""
-        if not isinstance(value_dict, dict):
-            return value_dict
-        if value_dict.get("isNull"):
-            return None
-        for key in ("stringValue", "longValue", "doubleValue", "booleanValue"):
-            if key in value_dict:
-                return value_dict[key]
-        return None
+    def update_order_transaction(
+        self,
+        order_id: str,
+        order_updates: dict,
+        old_item_sks: list[str],
+        new_item_children: list[dict] | None,
+    ) -> None:
+        """
+        Update the ORDER item's attributes and, if new_item_children is
+        provided, replace all ITEM# children (delete old, put new) — all in
+        one transaction.
+        """
+        update_expr_parts = []
+        expr_names = {}
+        expr_values = {}
+        for i, (k, v) in enumerate(order_updates.items()):
+            name_ph = f"#f{i}"
+            value_ph = f":v{i}"
+            update_expr_parts.append(f"{name_ph} = {value_ph}")
+            expr_names[name_ph] = k
+            expr_values[value_ph] = v
 
-    @staticmethod
-    def _format_response(rows, description, includeResultMetadata: bool = False) -> dict:
-        """Convert psycopg2 results to RDS Data API format."""
-        if not description:
-            return {"records": [], "columnMetadata": []}
+        transact_items = [
+            {
+                "Update": {
+                    "TableName": self.orders_table_name,
+                    "Key": _to_dynamo({"order_id": order_id, "sk": "ORDER"}),
+                    "UpdateExpression": "SET " + ", ".join(update_expr_parts),
+                    "ExpressionAttributeNames": expr_names,
+                    "ExpressionAttributeValues": _to_dynamo(expr_values),
+                    "ConditionExpression": "attribute_exists(order_id)",
+                }
+            }
+        ]
 
-        column_names = [desc.name for desc in description]
+        if new_item_children is not None:
+            for sk in old_item_sks:
+                transact_items.append({
+                    "Delete": {
+                        "TableName": self.orders_table_name,
+                        "Key": _to_dynamo({"order_id": order_id, "sk": sk}),
+                    }
+                })
+            for child in new_item_children:
+                transact_items.append({
+                    "Put": {
+                        "TableName": self.orders_table_name,
+                        "Item": _to_dynamo(child),
+                    }
+                })
 
-        records = []
-        for row in rows:
-            record = []
-            for col in column_names:
-                value = row[col]
-                if value is None:
-                    record.append({"isNull": True})
-                elif isinstance(value, bool):
-                    record.append({"booleanValue": value})
-                elif isinstance(value, int):
-                    record.append({"longValue": value})
-                elif isinstance(value, float):
-                    record.append({"doubleValue": value})
-                else:
-                    record.append({"stringValue": str(value)})
-            records.append(record)
+        self._client.transact_write_items(TransactItems=transact_items)
 
-        result = {"records": records}
-        if includeResultMetadata:
-            result["columnMetadata"] = [{"name": n} for n in column_names]
+    # ------------------------------------------------------------------
+    # Products
+    # ------------------------------------------------------------------
+
+    def batch_get_products(self, product_ids: list[str]) -> dict[str, dict]:
+        """Returns {product_id: item} for whichever of the given ids exist."""
+        if not product_ids:
+            return {}
+
+        result = {}
+        # BatchGetItem caps at 100 keys per call.
+        for i in range(0, len(product_ids), 100):
+            chunk = product_ids[i:i + 100]
+            request_items = {
+                self.products_table_name: {
+                    "Keys": [{"product_id": pid} for pid in chunk]
+                }
+            }
+            while request_items:
+                resp = self._resource.batch_get_item(RequestItems=request_items)
+                for item in resp["Responses"].get(self.products_table_name, []):
+                    result[item["product_id"]] = item
+                request_items = resp.get("UnprocessedKeys") or {}
         return result
 
-    def close(self):
-        if self.connection:
-            self.connection.close()
+    def update_product_reorder_state(self, product_id: str, current_qty, threshold) -> None:
+        """
+        Maintain the sparse ReorderIndex: set reorder_flag="true" once a
+        product is at/under its low-stock threshold, remove it once
+        restocked above threshold. Not part of the stock-decrement
+        transaction on purpose — this is a secondary, eventually-consistent
+        signal for the reorder report, not something order correctness
+        depends on.
+        """
+        if current_qty <= threshold:
+            self.products_table.update_item(
+                Key={"product_id": product_id},
+                UpdateExpression="SET reorder_flag = :flag",
+                ExpressionAttributeValues={":flag": "true"},
+            )
+        else:
+            self.products_table.update_item(
+                Key={"product_id": product_id},
+                UpdateExpression="REMOVE reorder_flag",
+            )
+
+    # ------------------------------------------------------------------
+    # Promotions
+    # ------------------------------------------------------------------
+
+    def get_promotion(self, code: str) -> dict | None:
+        resp = self.promotions_table.get_item(Key={"code": code})
+        return resp.get("Item")
 
 
-def get_db_client() -> PostgreSQLClient:
-    return PostgreSQLClient()
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def get_db_client() -> DynamoDBClient:
+    return DynamoDBClient()

@@ -8,18 +8,31 @@ Query Parameters:
   - low_stock   (bool, default false) — only return low-stock items
 
 Environment Variables:
-  - DB_HOST      PostgreSQL host
-  - DB_PORT      PostgreSQL port (default 5432)
-  - DB_USER      Database user
-  - DB_PASSWORD  Database password
-  - DB_NAME      Database name
+  - PRODUCTS_TABLE_NAME   DynamoDB table name (aws_dynamodb_table.products.name)
+
+Data source: DynamoDB (products table).
+  - Single product lookup -> GetItem on product_id.
+  - category filter        -> Query on CategoryIndex (hash=category, range=name),
+                               already sorted by name.
+  - low_stock filter only  -> Query on the sparse ReorderIndex
+                               (hash=reorder_flag="true", range=product_id).
+  - no filters              -> full table Scan (no index spans every category).
+
+NOTE ON PAGINATION: DynamoDB doesn't support SQL-style OFFSET/LIMIT paging.
+To keep the existing "page"/"page_size" API contract for callers, this
+handler pulls the *entire* matching result set (via Query/Scan pagination
+with LastEvaluatedKey), sorts it in memory, and slices out the requested
+page. That's fine for a catalog of up to a few thousand active products,
+but it means every page request re-reads the whole filtered set — it does
+not scale the way cursor-based (ExclusiveStartKey) pagination would. If the
+catalog grows large, we should switch the frontend to cursor-based paging.
 """
 
 import json
 import os
 import traceback
+from decimal import Decimal
 
-# Import DB helper (uses PostgreSQL)
 from db import get_db_client
 
 DEFAULT_PAGE_SIZE = 100
@@ -58,11 +71,18 @@ def cors_headers() -> dict:
     }
 
 
+def _json_default(value):
+    """json.dumps default= handler — DynamoDB numbers come back as Decimal."""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return str(value)
+
+
 def ok(body: dict, status: int = 200) -> dict:
     return {
         "statusCode": status,
         "headers": cors_headers(),
-        "body": json.dumps(body, default=str),
+        "body": json.dumps(body, default=_json_default),
     }
 
 
@@ -74,17 +94,34 @@ def err(message: str, status: int = 400) -> dict:
     }
 
 
-def rows_to_dicts(column_metadata: list, records: list) -> list[dict]:
-    """Convert RDS Data API response records into a list of dicts."""
-    columns = [col["name"] for col in column_metadata]
-    result = []
-    for record in records:
-        row = {}
-        for col, field in zip(columns, record):
-            value = next(iter(field.values())) if field != {"isNull": True} else None
-            row[col] = value
-        result.append(row)
-    return result
+def _is_low_stock(item: dict) -> bool:
+    qty = item.get("qty", 0)
+    threshold = item.get("low_stock_threshold", 0)
+    return qty <= threshold
+
+
+def _serialize_product(item: dict) -> dict:
+    """Shape a raw DynamoDB item into the same response shape the API used to
+    return from Postgres (keeps the frontend contract stable)."""
+    return {
+        "id": item.get("product_id"),
+        "sku": item.get("sku"),
+        "name": item.get("name"),
+        "description": item.get("description"),
+        "image_url": item.get("image_url"),
+        "category": item.get("category"),
+        "price": item.get("price"),
+        "current_stock": item.get("qty"),
+        "low_stock_threshold": item.get("low_stock_threshold"),
+        "active": item.get("active"),
+        "is_low_stock": _is_low_stock(item),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _sort_key(item: dict):
+    return (item.get("category") or "", item.get("name") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -93,52 +130,19 @@ def rows_to_dicts(column_metadata: list, records: list) -> list[dict]:
 
 def _handle_get_product(db, product_id: str) -> dict:
     """Fetch a single product by ID."""
-    try:
-        product_id_int = int(product_id)
-    except (ValueError, TypeError):
+    if not product_id:
         return err("Invalid product ID format", status=400)
 
-    sql = """
-        SELECT
-            p.id,
-            p.sku,
-            p.name,
-            p.description,
-            p.image_url,
-            p.category,
-            p.price,
-            p.qty             AS current_stock,
-            p.low_stock_threshold,
-            p.active,
-            CASE WHEN p.qty <= p.low_stock_threshold THEN 1 ELSE 0 END AS is_low_stock,
-            p.created_at,
-            p.updated_at
-        FROM products p
-        WHERE p.id = $1
-    """
-    
     try:
-        resp = db.execute_statement(
-            sql=sql,
-            parameters=[{"name": "id", "value": {"longValue": product_id_int}}],
-            includeResultMetadata=True,
-        )
-        
-        if not resp.get("records"):
+        item = db.get_product(product_id)
+
+        if not item:
             return err(f"Product with ID {product_id} not found", status=404)
-        
-        product = rows_to_dicts(resp["columnMetadata"], resp["records"])[0]
-        
-        return ok({
-            "data": product
-        })
-        
-    except ConnectionError as e:
-        print(f"[ERROR] Database connection error: {e}")
-        print(traceback.format_exc())
-        return err(f"Database connection failed: {str(e)}", status=503)
+
+        return ok({"data": _serialize_product(item)})
+
     except Exception as e:
-        print(f"[ERROR] Unexpected database error: {e}")
+        print(f"[ERROR] Unexpected DynamoDB error: {e}")
         print(traceback.format_exc())
         return err(f"Database query failed: {str(e)}", status=500)
 
@@ -149,21 +153,21 @@ def _handle_get_product(db, product_id: str) -> dict:
 
 def lambda_handler(event: dict, context) -> dict:
     print(f"[DEBUG] event: {json.dumps(event, default=str)}")
-    print(f"[DEBUG] env: DB_HOST={os.environ.get('DB_HOST')} DB_PORT={os.environ.get('DB_PORT')} DB_NAME={os.environ.get('DB_NAME')} DB_USER={os.environ.get('DB_USER')} DB_PASSWORD={'***' if os.environ.get('DB_PASSWORD') else 'NOT SET'}")
+    print(f"[DEBUG] env: PRODUCTS_TABLE_NAME={os.environ.get('PRODUCTS_TABLE_NAME')}")
 
     # -- DB client -----------------------------------------------------------
     try:
         db = get_db_client()
         print(f"[DEBUG] db client created: {type(db)}")
     except Exception as e:
-        print(f"[ERROR] Failed to create DB client: {e}")
+        print(f"[ERROR] Failed to create DynamoDB client: {e}")
         print(traceback.format_exc())
         return err("Failed to initialise database client", status=500)
 
     # -- Check for product ID in path parameters ----------------------------
     path_params = event.get("pathParameters") or {}
     product_id = path_params.get("productid")
-    
+
     if product_id:
         return _handle_get_product(db, product_id)
 
@@ -182,112 +186,37 @@ def lambda_handler(event: dict, context) -> dict:
     )
     category  = params.get("category", "").strip() or None
 
-    offset = (page - 1) * page_size
-    print(f"[DEBUG] parsed: show_all={show_all} low_stock={low_stock} page={page} page_size={page_size} category={category} offset={offset}")
+    active_only = not show_all
+    print(f"[DEBUG] parsed: show_all={show_all} low_stock={low_stock} page={page} page_size={page_size} category={category}")
 
-    # -- Build WHERE clauses & parameter list --------------------------------
-    conditions   = []
-    sql_params   = []
-    param_index  = 1
-
-    if not show_all:
-        conditions.append(f"p.active = ${param_index}")
-        sql_params.append({"name": "active", "value": {"booleanValue": True}})
-        param_index += 1
-
-    if category:
-        conditions.append(f"p.category = ${param_index}")
-        sql_params.append({"name": "category", "value": {"stringValue": category}})
-        param_index += 1
-
-    if low_stock:
-        conditions.append("p.qty <= p.low_stock_threshold")
-
-    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    # -- Count query ---------------------------------------------------------
-    count_sql = f"SELECT COUNT(*) AS total FROM products p {where_clause}"
-    print(f"[DEBUG] count_sql: {count_sql}")
-    print(f"[DEBUG] sql_params: {sql_params}")
-
-    # -- Data query ----------------------------------------------------------
-    data_sql = f"""
-        SELECT
-            p.id,
-            p.sku,
-            p.name,
-            p.description,
-            p.image_url,
-            p.category,
-            p.price,
-            p.qty             AS current_stock,
-            p.low_stock_threshold,
-            p.active,
-            CASE WHEN p.qty <= p.low_stock_threshold THEN 1 ELSE 0 END AS is_low_stock,
-            p.created_at,
-            p.updated_at
-        FROM products p
-        {where_clause}
-        ORDER BY p.category ASC, p.name ASC
-        LIMIT ${param_index}
-        OFFSET ${param_index + 1}
-    """
-    print(f"[DEBUG] data_sql: {data_sql}")
-
-    paginated_params = sql_params + [
-        {"name": "limit",  "value": {"longValue": page_size}},
-        {"name": "offset", "value": {"longValue": offset}},
-    ]
-
-    # -- Execute -------------------------------------------------------------
+    # -- Fetch matching items --------------------------------------------
     try:
-        print("[DEBUG] executing count query...")
-        count_resp = db.execute_statement(
-            sql=count_sql,
-            parameters=sql_params,
-        )
-        print(f"[DEBUG] count_resp: {count_resp}")
-        
-        if not count_resp.get("records"):
-            print("[ERROR] Count query returned no records")
-            return err("Failed to retrieve product count from database", status=500)
-        
-        total_items = count_resp["records"][0][0]["longValue"]
+        if category:
+            items = db.query_by_category(category, active_only)
+            if low_stock:
+                items = [i for i in items if _is_low_stock(i)]
+            # Query on CategoryIndex already returns items sorted by name.
+        elif low_stock:
+            items = db.query_low_stock(active_only)
+            items.sort(key=_sort_key)
+        else:
+            items = db.scan_all(active_only)
+            items.sort(key=_sort_key)
 
-        print("[DEBUG] executing data query...")
-        data_resp = db.execute_statement(
-            sql=data_sql,
-            parameters=paginated_params,
-            includeResultMetadata=True,
-        )
-        print(f"[DEBUG] data_resp record count: {len(data_resp.get('records', []))}")
-        
-        if "columnMetadata" not in data_resp:
-            print("[ERROR] Data query response missing columnMetadata")
-            return err("Database query response format error: missing column metadata", status=500)
-
-    except ConnectionError as e:
-        print(f"[ERROR] Database connection error: {e}")
-        print(traceback.format_exc())
-        return err(f"Database connection failed: {str(e)}", status=503)
-    except ValueError as e:
-        print(f"[ERROR] Database response parsing error: {e}")
-        print(traceback.format_exc())
-        return err(f"Failed to parse database response: {str(e)}", status=500)
-    except KeyError as e:
-        print(f"[ERROR] Missing expected field in database response: {e}")
-        print(traceback.format_exc())
-        return err(f"Database response missing expected field: {str(e)}", status=500)
     except Exception as e:
-        print(f"[ERROR] Unexpected database error: {e}")
+        print(f"[ERROR] Unexpected DynamoDB error: {e}")
         print(traceback.format_exc())
         return err(f"Database query failed: {str(e)}", status=500)
 
-    products = rows_to_dicts(data_resp["columnMetadata"], data_resp["records"])
+    # -- Paginate in memory (see module docstring for why) --------------
+    total_items = len(items)
     total_pages = max(1, -(-total_items // page_size))
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = [_serialize_product(i) for i in items[start:end]]
 
     return ok({
-        "data": products,
+        "data": page_items,
         "pagination": {
             "page":        page,
             "page_size":   page_size,

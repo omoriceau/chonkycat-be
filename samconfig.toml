@@ -13,29 +13,20 @@ version = 0.1
 # DEV
 # ============================================================
 [dev.deploy.parameters]
-stack_name        = "chonkychonk-dev"
+stack_name        = "chonkychonk-products-dev"
 region            = "us-east-1"
 confirm_changeset = false
-capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+capabilities      = "CAPABILITY_IAM"
 s3_bucket         = "chonkychonk-sam-artifacts-dev"
 resolve_s3        = false
-
 parameter_overrides = [
-  "Environment=dev",
-  "DBHost=$DB_HOST",
-  "DBPort=$DB_PORT",
-  "DBUser=$DB_USER",
-  "DBName=chonkydb",
-  "VpcId=$VPC_ID",
-  "SubnetIds=$SUBNET_IDS",
-  "SecurityGroupId=$SECURITY_GROUP_ID",
+  "UsersTableName=chonky-users-dev",
+  "ProductsTableName=chonky-products-dev",
+  "OrdersTableName=chonky-orders-dev",
+  "PaymentsTableName=chonky-payments-dev",
+  "PromotionsTableName=chonky-promotions-dev",
   "EventBusName=chonkychonk-bus",
-  "CognitoEnabled=false",
-  "CognitoUserPoolId=none",
-  "CognitoAppClientId=none",
-  "ApigwWsEndpoint=none",
-  "SnsOpsTopicArn=none",
-  "DBPasswordSecretName=chonky/dev/db_pass",
   "StripeSecretKeySecretName=chonky/dev/stripe_secret_key",
-  "SSHPrivateKeySecretName=chonky/dev/ssh_private_key",
+  "StripeWebhookSecretName=chonky/dev/stripe_webhook_secret",
+  "DevEmail=dev@example.com",
 ]

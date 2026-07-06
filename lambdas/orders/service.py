@@ -2,18 +2,25 @@
 orders/service.py
 
 OrderService handles:
-  - Product lookup + stock validation
+  - Product lookup + stock validation (+ atomic decrement on create)
   - Promotion code resolution
   - Tax + shipping calculation
-  - Order + order_items DB writes
+  - Order + order-item writes (single-table design in DynamoDB)
   - connection_id persistence (for WebSocket callback)
-  - EventBridge: OrderCreated (→ Payment Lambda)
-  - EventBridge: LowStockDetected (→ Email Lambda) when items cross threshold
+  - EventBridge: OrderCreated (-> Payment Lambda)
+  - EventBridge: LowStockDetected (-> Email Lambda) when items cross threshold
+    (also maintains the products table's sparse reorder_flag attribute)
+
+MONEY FIELDS: stored as DynamoDB strings (not Number/Decimal) — same
+representation the original RDS Data API calls used (stringValue), and it
+sidesteps float/Decimal round-tripping quirks with DynamoDB's Number type.
+Parsed back to Decimal on read via Decimal(str(...)), same as before.
 """
 
 import json
 import logging
 import os
+import uuid
 from decimal import Decimal, ROUND_HALF_UP
 
 import boto3
@@ -50,6 +57,11 @@ def _cents(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 class OrderService:
 
     def __init__(
@@ -57,213 +69,96 @@ class OrderService:
         db_client=None,
         events_client=None,
     ):
-        from db import PostgreSQLClient
-        self._db      = db_client       or PostgreSQLClient()
-        self._events  = events_client   or boto3.client("events")
+        from db import get_db_client, InsufficientStock
+        self._db      = db_client     or get_db_client()
+        self._events  = events_client or boto3.client("events")
+        self._InsufficientStock = InsufficientStock
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
-    def get_order(self, order_id: int) -> dict | None:
+    def get_order(self, order_id: str) -> dict | None:
         """
         Retrieve a single order by ID with all its items.
         Returns a dict with order details and items, or None if not found.
         """
-        sql = """
-            SELECT id, user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
-                   customer_notes, created_at,
-                   shipping_name, shipping_address1, shipping_address2,
-                   shipping_city, shipping_province, shipping_postal_code, shipping_country
-            FROM   orders
-            WHERE  id = $1
-        """
-        resp = self._execute(
-            sql,
-            [{"name": "order_id", "value": {"longValue": order_id}}],
-            "get_order",
-            include_metadata=True,
-        )
-        
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
-        if not rows:
+        result = self._db.get_order_with_children(order_id)
+        if result is None:
             return None
-        
-        order = rows[0]
-        
-        # Fetch order items
-        items_sql = """
-            SELECT product_id, quantity, unit_price, line_total, name_snapshot
-            FROM   order_items
-            WHERE  order_id = $1
-            ORDER BY id ASC
-        """
-        items_resp = self._execute(
-            items_sql,
-            [{"name": "order_id", "value": {"longValue": order_id}}],
-            "get_order_items",
-            include_metadata=True,
-        )
-        
-        items = self._to_dicts(items_resp["columnMetadata"], items_resp["records"])
-        
-        return {
-            "order_id": order["id"],
-            "user_id": order["user_id"],
-            "status": order["status"],
-            "subtotal": str(order["subtotal"]),
-            "tax": str(order["tax_amount"]),
-            "shipping_fee": str(order["shipping_amount"]),
-            "total": str(order["total_amount"]),
-            "customer_notes": order["customer_notes"],
-            "created_at": order["created_at"],
-            "shipping_address": {
-                "name": order["shipping_name"],
-                "address1": order["shipping_address1"],
-                "address2": order["shipping_address2"],
-                "city": order["shipping_city"],
-                "province": order["shipping_province"],
-                "postal_code": order["shipping_postal_code"],
-                "country": order["shipping_country"],
-            },
-            "items": items,
-        }
 
-    def delete_order(self, order_id: int) -> bool:
+        order = result["order"]
+        if order.get("deleted_at"):
+            return None
+
+        return self._order_to_response(order, result["items"])
+
+    def delete_order(self, order_id: str) -> bool:
         """
-        Soft delete an order by setting deleted_at timestamp.
-        Returns True if successful, False if order not found.
-        """
-        # Check if order exists
-        check_sql = "SELECT id FROM orders WHERE id = $1 AND deleted_at IS NULL"
-        check_resp = self._execute(
-            check_sql,
-            [{"name": "order_id", "value": {"longValue": order_id}}],
-            "check_order_exists",
-            include_metadata=True,
-        )
-        
-        rows = self._to_dicts(check_resp["columnMetadata"], check_resp["records"])
-        if not rows:
-            return False
-        
-        # Soft delete
-        sql = """
-            UPDATE orders
-            SET deleted_at = CURRENT_TIMESTAMP
-            WHERE id = $1
+        Soft delete an order by setting a deleted_at timestamp.
+        Returns True if successful, False if order not found (or already deleted).
         """
         try:
-            self._execute(
-                sql,
-                [{"name": "order_id", "value": {"longValue": order_id}}],
-                "delete_order",
-            )
-            logger.info("Order soft deleted | order_id=%s", order_id)
-            return True
+            deleted = self._db.soft_delete_order(order_id)
+            if deleted:
+                logger.info("Order soft deleted | order_id=%s", order_id)
+            return deleted
         except Exception as e:
             logger.error("Failed to delete order %s: %s", order_id, e)
             raise
 
-    def update_order(self, order_id: int, update: dict) -> dict | None:
+    def update_order(self, order_id: str, update: dict) -> dict | None:
         """
         Update an order with new items, shipping, notes, or promotion code.
         Only allows updates to pending orders (status='pending').
         Recalculates totals if items or promotion changes.
         Returns updated order dict, or None if order not found.
         """
-        # 1. Fetch current order
-        current_order_sql = """
-            SELECT id, user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
-                   customer_notes, created_at,
-                   shipping_name, shipping_address1, shipping_address2,
-                   shipping_city, shipping_province, shipping_postal_code, shipping_country
-            FROM   orders
-            WHERE  id = $1 AND deleted_at IS NULL
-        """
-        resp = self._execute(
-            current_order_sql,
-            [{"name": "order_id", "value": {"longValue": order_id}}],
-            "fetch_order_for_update",
-            include_metadata=True,
-        )
-        
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
-        if not rows:
+        # 1. Fetch current order + items
+        current_state = self._db.get_order_with_children(order_id)
+        if current_state is None or current_state["order"].get("deleted_at"):
             return None
-        
-        current = rows[0]
-        
+
+        current = current_state["order"]
+        current_item_rows = current_state["items"]
+
         # 2. Only allow updates to pending orders
         if current["status"] != "pending":
             raise ValidationError(f"Cannot update order with status '{current['status']}'")
-        
+
         # 3. Resolve updated fields
-        items = update.get("items")
-        shipping = update.get("shipping")
+        items          = update.get("items")
+        shipping       = update.get("shipping")
         customer_notes = update.get("customer_notes")
         promotion_code = update.get("promotion_code")
-        
+
         # If items changed, re-resolve and recalculate
         if items is not None:
             resolved_items = self._resolve_items(items)
             subtotal = _cents(sum(i.line_total for i in resolved_items))
         else:
-            # Fetch existing items
-            items_sql = """
-                SELECT product_id, quantity, unit_price, line_total, name_snapshot
-                FROM   order_items
-                WHERE  order_id = $1
-                ORDER BY id ASC
-            """
-            items_resp = self._execute(
-                items_sql,
-                [{"name": "order_id", "value": {"longValue": order_id}}],
-                "fetch_order_items_for_update",
-                include_metadata=True,
-            )
-            
-            items_data = self._to_dicts(items_resp["columnMetadata"], items_resp["records"])
             resolved_items = [
                 ResolvedOrderItem(
-                    product_id=i["product_id"],
-                    name_snapshot=i["name_snapshot"],
-                    quantity=i["quantity"],
-                    unit_price=Decimal(str(i["unit_price"])),
-                    line_total=Decimal(str(i["line_total"])),
+                    product_id=row["product_id"],
+                    name_snapshot=row["name_snapshot"],
+                    quantity=int(row["quantity"]),
+                    unit_price=Decimal(str(row["unit_price"])),
+                    line_total=Decimal(str(row["line_total"])),
                 )
-                for i in items_data
+                for row in current_item_rows
             ]
             subtotal = Decimal(str(current["subtotal"]))
-        
+
         # Resolve promotion
-        promotion_id, discount = self._resolve_promotion(promotion_code, resolved_items)
-        
+        promotion_code_resolved, discount = self._resolve_promotion(promotion_code, resolved_items)
+
         # Calculate new totals
-        discounted_sub = _cents(max(Decimal("0"), subtotal - discount))
+        discounted_sub  = _cents(max(Decimal("0"), subtotal - discount))
         shipping_amount = Decimal("0") if discounted_sub >= FREE_SHIP_ABOVE else FLAT_SHIP_FEE
-        tax_amount = _cents(discounted_sub * TAX_RATE)
-        total_amount = _cents(discounted_sub + tax_amount + shipping_amount)
-        
-        # 4. Update order in DB
-        update_sql = """
-            UPDATE orders
-            SET    subtotal = $1,
-                   tax_amount = $2,
-                   shipping_amount = $3,
-                   total_amount = $4,
-                   customer_notes = $5,
-                   shipping_name = $6,
-                   shipping_address1 = $7,
-                   shipping_address2 = $8,
-                   shipping_city = $9,
-                   shipping_province = $10,
-                   shipping_postal_code = $11,
-                   shipping_country = $12,
-                   updated_at = CURRENT_TIMESTAMP
-            WHERE  id = $13
-        """
-        
+        tax_amount      = _cents(discounted_sub * TAX_RATE)
+        total_amount    = _cents(discounted_sub + tax_amount + shipping_amount)
+
+        # 4. Build the ORDER item update
         shipping_obj = shipping or ShippingAddress(
             name=current["shipping_name"],
             address1=current["shipping_address1"],
@@ -271,83 +166,51 @@ class OrderService:
             province=current["shipping_province"],
             postal_code=current["shipping_postal_code"],
             country=current["shipping_country"],
-            address2=current["shipping_address2"],
+            address2=current.get("shipping_address2"),
         )
-        
-        notes = customer_notes if customer_notes is not None else current["customer_notes"]
-        
-        self._execute(
-            update_sql,
-            [
-                {"name": "subtotal",      "value": {"stringValue": str(subtotal)}},
-                {"name": "tax",           "value": {"stringValue": str(tax_amount)}},
-                {"name": "shipping",      "value": {"stringValue": str(shipping_amount)}},
-                {"name": "total",         "value": {"stringValue": str(total_amount)}},
-                {"name": "notes",         "value": {"stringValue": notes or ""} if notes else {"isNull": True}},
-                {"name": "s_name",        "value": {"stringValue": shipping_obj.name}},
-                {"name": "s_addr1",       "value": {"stringValue": shipping_obj.address1}},
-                {"name": "s_addr2",       "value": {"stringValue": shipping_obj.address2 or ""} if shipping_obj.address2 else {"isNull": True}},
-                {"name": "s_city",        "value": {"stringValue": shipping_obj.city}},
-                {"name": "s_prov",        "value": {"stringValue": shipping_obj.province}},
-                {"name": "s_postal",      "value": {"stringValue": shipping_obj.postal_code}},
-                {"name": "s_country",     "value": {"stringValue": shipping_obj.country}},
-                {"name": "order_id",      "value": {"longValue": order_id}},
-            ],
-            "update_order",
-        )
-        
-        # 5. Update items if provided
-        if items is not None:
-            # Delete existing items
-            delete_items_sql = "DELETE FROM order_items WHERE order_id = $1"
-            self._execute(
-                delete_items_sql,
-                [{"name": "order_id", "value": {"longValue": order_id}}],
-                "delete_order_items",
-            )
-            
-            # Insert new items
-            for item in resolved_items:
-                item_sql = """
-                    INSERT INTO order_items
-                      (order_id, product_id, quantity, unit_price, line_total, name_snapshot)
-                    VALUES
-                      ($1, $2, $3, $4, $5, $6)
-                """
-                self._execute(item_sql, [
-                    {"name": "order_id",   "value": {"longValue": order_id}},
-                    {"name": "product_id", "value": {"longValue": item.product_id}},
-                    {"name": "qty",        "value": {"longValue": item.quantity}},
-                    {"name": "unit_price", "value": {"stringValue": str(item.unit_price)}},
-                    {"name": "line_total", "value": {"stringValue": str(item.line_total)}},
-                    {"name": "name",       "value": {"stringValue": item.name_snapshot}},
-                ], "insert_updated_order_item")
-        
-        # 6. Update promotion if provided
+        notes = customer_notes if customer_notes is not None else current.get("customer_notes")
+
+        order_updates = {
+            "subtotal": str(subtotal),
+            "tax_amount": str(tax_amount),
+            "shipping_amount": str(shipping_amount),
+            "total_amount": str(total_amount),
+            "customer_notes": notes,
+            "shipping_name": shipping_obj.name,
+            "shipping_address1": shipping_obj.address1,
+            "shipping_address2": shipping_obj.address2,
+            "shipping_city": shipping_obj.city,
+            "shipping_province": shipping_obj.province,
+            "shipping_postal_code": shipping_obj.postal_code,
+            "shipping_country": shipping_obj.country,
+            "updated_at": _now_iso(),
+        }
         if promotion_code is not None:
-            # Delete existing promotion
-            delete_promo_sql = "DELETE FROM order_promotions WHERE order_id = $1"
-            self._execute(
-                delete_promo_sql,
-                [{"name": "order_id", "value": {"longValue": order_id}}],
-                "delete_order_promotion",
+            order_updates["applied_promotions"] = (
+                [{"code": promotion_code_resolved, "discount_amount": str(discount)}]
+                if promotion_code_resolved else []
             )
-            
-            # Insert new promotion
-            if promotion_id:
-                promo_sql = """
-                    INSERT INTO order_promotions (order_id, promotion_id, discount_amount)
-                    VALUES ($1, $2, $3)
-                """
-                self._execute(promo_sql, [
-                    {"name": "order_id",  "value": {"longValue": order_id}},
-                    {"name": "promo_id",  "value": {"longValue": promotion_id}},
-                    {"name": "discount",  "value": {"stringValue": str(discount)}},
-                ], "insert_updated_order_promotion")
-        
+
+        # 5. Build replacement ITEM# children, if items changed
+        new_item_children = None
+        if items is not None:
+            new_item_children = [
+                self._make_item_child(order_id, idx, item)
+                for idx, item in enumerate(resolved_items)
+            ]
+
+        old_item_sks = [row["sk"] for row in current_item_rows]
+
+        self._db.update_order_transaction(
+            order_id=order_id,
+            order_updates=order_updates,
+            old_item_sks=old_item_sks,
+            new_item_children=new_item_children,
+        )
+
         logger.info("Order updated | order_id=%s", order_id)
-        
-        # 7. Return updated order
+
+        # 6. Return updated order
         return {
             "order_id": order_id,
             "status": "pending",
@@ -378,7 +241,7 @@ class OrderService:
         resolved_items = self._resolve_items(request.items)
 
         # 2. Resolve promotion (optional)
-        promotion_id, discount = self._resolve_promotion(request.promotion_code, resolved_items)
+        promotion_code_resolved, discount = self._resolve_promotion(request.promotion_code, resolved_items)
 
         # 3. Calculate totals
         subtotal        = _cents(sum(i.line_total for i in resolved_items))
@@ -397,7 +260,7 @@ class OrderService:
             shipping_amount  = shipping_amount,
             discount_amount  = discount,
             total_amount     = total_amount,
-            promotion_id     = promotion_id,
+            promotion_id     = promotion_code_resolved,
             promotion_code   = request.promotion_code,
             customer_notes   = request.customer_notes,
             currency         = request.currency,
@@ -405,13 +268,14 @@ class OrderService:
             payment_provider = request.payment_provider,
         )
 
-        # 4. Persist order
+        # 4. Persist order (+ atomically decrement stock)
         order_id = self._insert_order(resolved)
 
-        # 5. Emit OrderCreated → Payment Lambda
+        # 5. Emit OrderCreated -> Payment Lambda
         self._emit_order_created(order_id, resolved)
 
         # 6. Emit LowStockDetected for any products that crossed the threshold
+        #    (and maintain each product's reorder_flag while we're at it)
         self._emit_low_stock_if_needed(resolved.items)
 
         return {
@@ -430,36 +294,21 @@ class OrderService:
     # ------------------------------------------------------------------
 
     def _resolve_items(self, items) -> list[ResolvedOrderItem]:
-        product_ids = [i.product_id for i in items]
-
-        # Fetch all requested products in one query
-        placeholders = ", ".join(f"${n+1}" for n in range(len(product_ids)))
-        sql = f"""
-            SELECT id, name, price, qty, active
-            FROM   products
-            WHERE  id IN ({placeholders})
-        """
-        params = [
-            {"name": f"pid{n}", "value": {"longValue": pid}}
-            for n, pid in enumerate(product_ids)
-        ]
-        resp = self._execute(sql, params, "resolve_products", include_metadata=True)
-
-        product_map = {}
-        for row in self._to_dicts(resp["columnMetadata"], resp["records"]):
-            product_map[row["id"]] = row
+        product_ids = [str(i.product_id) for i in items]
+        product_map = self._db.batch_get_products(product_ids)
 
         resolved = []
         for item in items:
-            product = product_map.get(item.product_id)
+            product = product_map.get(str(item.product_id))
             if not product:
                 raise ValidationError(f"Product {item.product_id} not found")
-            if not product["active"]:
+            if not product.get("active"):
                 raise ValidationError(f"Product {item.product_id} is not available")
-            if product["qty"] < item.quantity:
+            qty = int(product["qty"])
+            if qty < item.quantity:
                 raise ValidationError(
                     f"Insufficient stock for '{product['name']}' "
-                    f"(requested {item.quantity}, available {product['qty']})"
+                    f"(requested {item.quantity}, available {qty})"
                 )
             unit_price = Decimal(str(product["price"]))
             resolved.append(ResolvedOrderItem(
@@ -478,29 +327,23 @@ class OrderService:
 
     def _resolve_promotion(
         self, code: str | None, items: list[ResolvedOrderItem]
-    ) -> tuple[int | None, Decimal]:
+    ) -> tuple[str | None, Decimal]:
+        """
+        Returns (resolved_code, discount_amount). The promotions table's
+        natural key IS the code (no separate surrogate id in the new
+        schema), so what used to be a numeric promotion_id is now just the
+        normalized code string itself.
+        """
         if not code:
             return None, Decimal("0")
 
-        sql = """
-            SELECT id, discount_type, discount_value, active, expires_at
-            FROM   promotions
-            WHERE  code = $1
-            LIMIT  1
-        """
-        resp = self._execute(
-            sql,
-            [{"name": "code", "value": {"stringValue": code.strip().upper()}}],
-            "resolve_promotion",
-            include_metadata=True,
-        )
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
+        normalized_code = code.strip().upper()
+        promo = self._db.get_promotion(normalized_code)
 
-        if not rows:
+        if not promo:
             raise ValidationError(f"Promotion code '{code}' is not valid")
 
-        promo = rows[0]
-        if not promo["active"]:
+        if not promo.get("active"):
             raise ValidationError(f"Promotion code '{code}' is no longer active")
 
         subtotal = sum(i.line_total for i in items)
@@ -511,82 +354,79 @@ class OrderService:
         else:
             discount = _cents(min(value, subtotal))
 
-        return promo["id"], discount
+        return normalized_code, discount
 
     # ------------------------------------------------------------------
     # DB writes
     # ------------------------------------------------------------------
 
-    def _insert_order(self, o: ResolvedOrder) -> int:
-        # 1. Insert order row with RETURNING to get the ID
-        sql = """
-            INSERT INTO orders (
-                user_id, status, subtotal, tax_amount, shipping_amount, total_amount,
-                customer_notes, connection_id,
-                shipping_name, shipping_address1, shipping_address2,
-                shipping_city, shipping_province, shipping_postal_code, shipping_country
-            ) VALUES (
-                $1, 'pending', $2, $3, $4, $5,
-                $6, $7,
-                $8, $9, $10,
-                $11, $12, $13, $14
-            )
-            RETURNING id
-        """
-        params = [
-            {"name": "user_id",       "value": {"longValue":   o.user_id}},
-            {"name": "subtotal",      "value": {"stringValue": str(o.subtotal)}},
-            {"name": "tax",           "value": {"stringValue": str(o.tax_amount)}},
-            {"name": "shipping",      "value": {"stringValue": str(o.shipping_amount)}},
-            {"name": "total",         "value": {"stringValue": str(o.total_amount)}},
-            {"name": "notes",         "value": {"stringValue": o.customer_notes or ""} if o.customer_notes else {"isNull": True}},
-            {"name": "connection_id", "value": {"stringValue": o.connection_id  or ""} if o.connection_id  else {"isNull": True}},
-            {"name": "s_name",        "value": {"stringValue": o.shipping.name}},
-            {"name": "s_addr1",       "value": {"stringValue": o.shipping.address1}},
-            {"name": "s_addr2",       "value": {"stringValue": o.shipping.address2 or ""} if o.shipping.address2 else {"isNull": True}},
-            {"name": "s_city",        "value": {"stringValue": o.shipping.city}},
-            {"name": "s_prov",        "value": {"stringValue": o.shipping.province}},
-            {"name": "s_postal",      "value": {"stringValue": o.shipping.postal_code}},
-            {"name": "s_country",     "value": {"stringValue": o.shipping.country}},
+    @staticmethod
+    def _make_item_child(order_id: str, idx: int, item: ResolvedOrderItem) -> dict:
+        return {
+            "order_id": order_id,
+            "sk": f"ITEM#{idx:04d}",
+            "product_id": str(item.product_id),
+            "quantity": item.quantity,
+            "unit_price": str(item.unit_price),
+            "line_total": str(item.line_total),
+            "name_snapshot": item.name_snapshot,
+        }
+
+    def _insert_order(self, o: ResolvedOrder) -> str:
+        order_id = str(uuid.uuid4())
+        created_at = _now_iso()
+
+        order_item = {
+            "order_id": order_id,
+            "sk": "ORDER",
+            "user_id": str(o.user_id),
+            "status": "pending",
+            "subtotal": str(o.subtotal),
+            "tax_amount": str(o.tax_amount),
+            "shipping_amount": str(o.shipping_amount),
+            "total_amount": str(o.total_amount),
+            "customer_notes": o.customer_notes,
+            "connection_id": o.connection_id,
+            "shipping_name": o.shipping.name,
+            "shipping_address1": o.shipping.address1,
+            "shipping_address2": o.shipping.address2,
+            "shipping_city": o.shipping.city,
+            "shipping_province": o.shipping.province,
+            "shipping_postal_code": o.shipping.postal_code,
+            "shipping_country": o.shipping.country,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        if o.promotion_id:  # holds the normalized promo code (see _resolve_promotion)
+            order_item["applied_promotions"] = [
+                {"code": o.promotion_id, "discount_amount": str(o.discount_amount)}
+            ]
+        # Drop unset optional fields — avoid storing None values as item attributes.
+        order_item = {k: v for k, v in order_item.items() if v is not None}
+
+        item_children = [
+            self._make_item_child(order_id, idx, item)
+            for idx, item in enumerate(o.items)
         ]
 
-        resp     = self._execute(sql, params, "insert_order", include_metadata=True)
-        order_id = resp["generatedFields"][0]["longValue"]
+        stock_decrements = [
+            {"product_id": str(item.product_id), "quantity": item.quantity}
+            for item in o.items
+        ]
 
-        # 2. Insert order items
+        try:
+            self._db.create_order_transaction(order_item, item_children, stock_decrements)
+        except self._InsufficientStock as e:
+            logger.error("Stock race on order create: %s", e)
+            raise ValidationError(
+                "One or more items sold out while your order was being placed. Please try again."
+            )
+
         for item in o.items:
-            item_sql = """
-                INSERT INTO order_items
-                  (order_id, product_id, quantity, unit_price, line_total, name_snapshot)
-                VALUES
-                  ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """
-            try:
-                self._execute(item_sql, [
-                    {"name": "order_id",   "value": {"longValue":   order_id}},
-                    {"name": "product_id", "value": {"longValue":   item.product_id}},
-                    {"name": "qty",        "value": {"longValue":   item.quantity}},
-                    {"name": "unit_price", "value": {"stringValue": str(item.unit_price)}},
-                    {"name": "line_total", "value": {"stringValue": str(item.line_total)}},
-                    {"name": "name",       "value": {"stringValue": item.name_snapshot}},
-                ], "insert_order_item", include_metadata=True)
-                logger.info("Order item inserted | order_id=%s product_id=%s qty=%s", order_id, item.product_id, item.quantity)
-            except Exception as e:
-                logger.error("Failed to insert order item | order_id=%s product_id=%s: %s", order_id, item.product_id, e)
-                raise
-
-        # 3. Insert order promotion (if any)
-        if o.promotion_id:
-            promo_sql = """
-                INSERT INTO order_promotions (order_id, promotion_id, discount_amount)
-                VALUES ($1, $2, $3)
-            """
-            self._execute(promo_sql, [
-                {"name": "order_id",  "value": {"longValue":   order_id}},
-                {"name": "promo_id",  "value": {"longValue":   o.promotion_id}},
-                {"name": "discount",  "value": {"stringValue": str(o.discount_amount)}},
-            ], "insert_order_promotion")
+            logger.info(
+                "Order item persisted | order_id=%s product_id=%s qty=%s",
+                order_id, item.product_id, item.quantity,
+            )
 
         return order_id
 
@@ -594,9 +434,9 @@ class OrderService:
     # EventBridge
     # ------------------------------------------------------------------
 
-    def _emit_order_created(self, order_id: int, o: ResolvedOrder) -> None:
+    def _emit_order_created(self, order_id: str, o: ResolvedOrder) -> None:
         """
-        Fires an OrderCreated event.  The Payment Lambda listens on this bus
+        Fires an OrderCreated event. The Payment Lambda listens on this bus
         filtered to source=chonkychonk.orders, detail-type=OrderCreated.
         """
         shipping_address = ", ".join(filter(None, [
@@ -651,33 +491,32 @@ class OrderService:
             # EventBridge should handle redelivery
             logger.error("Failed to emit OrderCreated event: %s", e)
 
-    # ------------------------------------------------------------------
-    # DB helpers
-    # ------------------------------------------------------------------
-
     def _emit_low_stock_if_needed(self, items: list) -> None:
         """
-        After an order is saved, check if any ordered products have dropped
-        to or below their low stock threshold. If so, emit LowStockDetected.
+        After an order is saved, re-read each ordered product's now-current
+        stock. For any that dropped to/below their low-stock threshold,
+        emit LowStockDetected AND flip on the products table's sparse
+        reorder_flag (see db.py) so the low-stock report picks it up. For
+        any that are now comfortably restocked, clear the flag.
         """
-        product_ids   = [i.product_id for i in items]
-        placeholders  = ", ".join(f"${n+1}" for n in range(len(product_ids)))
-        sql = f"""
-            SELECT id, sku, name, category, qty AS current_stock, low_stock_threshold
-            FROM   products
-            WHERE  id IN ({placeholders})
-            AND    qty <= low_stock_threshold
-        """
-        params = [
-            {"name": f"pid{n}", "value": {"longValue": pid}}
-            for n, pid in enumerate(product_ids)
-        ]
-        try:
-            resp = self._execute(sql, params, "low_stock_check", include_metadata=True)
-            low  = self._to_dicts(resp["columnMetadata"], resp["records"])
-        except ClientError:
-            logger.error("Low stock check query failed — skipping emit")
-            return
+        product_ids = [str(i.product_id) for i in items]
+        product_map = self._db.batch_get_products(product_ids)
+
+        low = []
+        for pid in product_ids:
+            product = product_map.get(pid)
+            if not product:
+                continue
+            qty = int(product["qty"])
+            threshold = int(product["low_stock_threshold"])
+
+            try:
+                self._db.update_product_reorder_state(pid, qty, threshold)
+            except ClientError as e:
+                logger.error("Failed to update reorder_flag for product %s: %s", pid, e)
+
+            if qty <= threshold:
+                low.append(product)
 
         if not low:
             return
@@ -685,12 +524,12 @@ class OrderService:
         logger.info("Low stock detected for %d product(s)", len(low))
         detail = {"products": [
             {
-                "product_id":    p["id"],
-                "sku":           p["sku"],
-                "name":          p["name"],
-                "category":      p["category"],
-                "current_stock": p["current_stock"],
-                "threshold":     p["low_stock_threshold"],
+                "product_id":    p["product_id"],
+                "sku":           p.get("sku"),
+                "name":          p.get("name"),
+                "category":      p.get("category"),
+                "current_stock": int(p["qty"]),
+                "threshold":     int(p["low_stock_threshold"]),
             }
             for p in low
         ]}
@@ -705,24 +544,39 @@ class OrderService:
         except ClientError as e:
             logger.error("Failed to emit LowStockDetected: %s", e)
 
-    def _execute(self, sql: str, params: list, label: str, include_metadata: bool = False) -> dict:
-        try:
-            return self._db.execute_statement(
-                sql=sql,
-                parameters=params,
-                includeResultMetadata=include_metadata,
-            )
-        except Exception as e:
-            logger.error("DB error [%s]: %s", label, e)
-            raise
+    # ------------------------------------------------------------------
+    # Response shaping
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _to_dicts(column_metadata: list, records: list) -> list[dict]:
-        columns = [col["name"] for col in column_metadata]
-        result  = []
-        for record in records:
-            row = {}
-            for col, field in zip(columns, record):
-                row[col] = next(iter(field.values())) if field != {"isNull": True} else None
-            result.append(row)
-        return result
+    def _order_to_response(order: dict, item_rows: list[dict]) -> dict:
+        return {
+            "order_id": order["order_id"],
+            "user_id": order["user_id"],
+            "status": order["status"],
+            "subtotal": str(order["subtotal"]),
+            "tax": str(order["tax_amount"]),
+            "shipping_fee": str(order["shipping_amount"]),
+            "total": str(order["total_amount"]),
+            "customer_notes": order.get("customer_notes"),
+            "created_at": order["created_at"],
+            "shipping_address": {
+                "name": order["shipping_name"],
+                "address1": order["shipping_address1"],
+                "address2": order.get("shipping_address2"),
+                "city": order["shipping_city"],
+                "province": order["shipping_province"],
+                "postal_code": order["shipping_postal_code"],
+                "country": order["shipping_country"],
+            },
+            "items": [
+                {
+                    "product_id": row["product_id"],
+                    "quantity": int(row["quantity"]),
+                    "unit_price": str(row["unit_price"]),
+                    "line_total": str(row["line_total"]),
+                    "name_snapshot": row["name_snapshot"],
+                }
+                for row in item_rows
+            ],
+        }

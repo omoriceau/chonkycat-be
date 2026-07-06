@@ -10,12 +10,15 @@ The frontend should include its WebSocket connection_id in the request body
 so the Payment Lambda can push the result back directly.
 
 Environment Variables:
-  - DB_HOST              PostgreSQL RDS endpoint
-  - DB_PORT              PostgreSQL port (default: 5432)
-  - DB_USER              Database user
-  - DB_NAME              Database name
-  - DB_PASSWORD_SECRET_NAME  Name of AWS Secrets Manager secret for DB password
-  - EVENT_BUS_NAME       EventBridge bus name (default: chonkychonk-bus)
+  - ORDERS_TABLE_NAME      DynamoDB orders table name
+  - PRODUCTS_TABLE_NAME    DynamoDB products table name (stock check/decrement)
+  - PROMOTIONS_TABLE_NAME  DynamoDB promotions table name
+  - EVENT_BUS_NAME         EventBridge bus name (default: chonkychonk-bus)
+
+NOTE: order IDs used to be sequential integers (Postgres SERIAL). They are
+now randomly generated UUID strings, since DynamoDB has no auto-increment
+primary key. Any client that parsed orderId as an int needs to change to
+treat it as an opaque string.
 
 Example request body:
 {
@@ -91,7 +94,7 @@ def lambda_handler(event: dict, context) -> dict:
     logger.info("Order request received")
 
     method = event.get("httpMethod", "")
-    
+
     # Route based on HTTP method
     if method == "GET":
         return _handle_get_order(event)
@@ -105,10 +108,18 @@ def lambda_handler(event: dict, context) -> dict:
         return err(f"Unsupported HTTP method: {method}", status=405)
 
 
+def _parse_order_id(event: dict) -> str:
+    """order_id is now a UUID string, not an int — just validate it's present."""
+    order_id = event["pathParameters"]["orderId"]
+    if not isinstance(order_id, str) or not order_id.strip():
+        raise ValueError("empty orderId")
+    return order_id
+
+
 def _handle_get_order(event: dict) -> dict:
     """GET /orders/{orderId}"""
     try:
-        order_id = int(event["pathParameters"]["orderId"])
+        order_id = _parse_order_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid orderId in path", status=400)
 
@@ -159,7 +170,7 @@ def _handle_create_order(event: dict) -> dict:
 def _handle_update_order(event: dict) -> dict:
     """PUT /orders/{orderId}"""
     try:
-        order_id = int(event["pathParameters"]["orderId"])
+        order_id = _parse_order_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid orderId in path", status=400)
 
@@ -199,7 +210,7 @@ def _handle_update_order(event: dict) -> dict:
 def _handle_delete_order(event: dict) -> dict:
     """DELETE /orders/{orderId}"""
     try:
-        order_id = int(event["pathParameters"]["orderId"])
+        order_id = _parse_order_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid orderId in path", status=400)
 

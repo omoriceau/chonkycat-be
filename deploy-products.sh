@@ -16,7 +16,24 @@ die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # ==============================================================================
 
 ENVIRONMENT="${1:-dev}"
-REGION="${2:-us-east-1}"
+
+# REGION: resolved from your AWS CLI's configured default region if you
+# don't pass one explicitly, since that's more likely to match wherever
+# terraform actually created the DynamoDB tables than a hardcoded guess.
+# Still double-check this against the region you applied the terraform in —
+# if `aws configure get region` returns nothing (no default set) this falls
+# back to us-east-1 and warns you.
+if [ -n "${2:-}" ]; then
+  REGION="$2"
+else
+  REGION="$(aws configure get region || true)"
+  if [ -z "$REGION" ]; then
+    REGION="us-east-1"
+    warn "No region passed and no AWS CLI default region configured — falling back to us-east-1."
+    warn "Pass it explicitly if your DynamoDB tables live elsewhere: $0 $ENVIRONMENT <region>"
+  fi
+fi
+
 DEV_EMAIL="${3:-dev@example.com}"
 
 case "$ENVIRONMENT" in
@@ -29,104 +46,62 @@ esac
 
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
 
-# Get RDS endpoint
-log "Fetching RDS endpoint..."
-DB_HOST=$(aws rds describe-db-instances \
-    --db-instance-identifier chonky-instance \
-    --region "$REGION" \
-    --query 'DBInstances[0].Endpoint.Address' \
-    --output text)
+# ==============================================================================
+# DynamoDB tables — all six lambdas are now fully migrated off RDS, so these
+# are the only data-layer inputs this deploy needs.
+#
+# NAME_PREFIX must match `var.name_prefix` in the terraform that created
+# these tables (aws_dynamodb_table.*.name = "${name_prefix}-<table>-${env}").
+# Confirmed via `aws dynamodb list-tables` that the actual prefix is
+# "chonky" — NOT "chonkychonk" like the rest of this stack's resource names
+# (event bus, S3 bucket, Lambda function names, stack name all use
+# "chonkychonk"). Two different naming conventions in play here; if
+# terraform's name_prefix ever changes, update this to match.
+# ==============================================================================
 
-if [ -z "$DB_HOST" ] || [ "$DB_HOST" = "None" ]; then
-    die "Could not find RDS instance 'chonky-instance' in $REGION"
-fi
+NAME_PREFIX="chonky"
 
-log "RDS endpoint: $DB_HOST"
+USERS_TABLE_NAME="${NAME_PREFIX}-users-${ENVIRONMENT}"
+PRODUCTS_TABLE_NAME="${NAME_PREFIX}-products-${ENVIRONMENT}"
+ORDERS_TABLE_NAME="${NAME_PREFIX}-orders-${ENVIRONMENT}"
+PAYMENTS_TABLE_NAME="${NAME_PREFIX}-payments-${ENVIRONMENT}"
+PROMOTIONS_TABLE_NAME="${NAME_PREFIX}-promotions-${ENVIRONMENT}"
 
-# Database credentials (from aws-setup.sh)
-DB_USER="chonky_admin"
-DB_NAME="chonkydb"
-DB_PORT="5432"
-
-# VPC configuration — required for Lambda to access RDS
-log "Fetching VPC configuration..."
-VPC_ID=$(aws ec2 describe-vpcs \
-    --filters "Name=tag:Name,Values=chonky-vpc" \
-    --region "$REGION" \
-    --query 'Vpcs[0].VpcId' \
-    --output text)
-
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-    die "Could not find VPC with tag Name=chonky-vpc in $REGION"
-fi
-
-SUBNET_IDS=$(aws ec2 describe-subnets \
-    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=chonky-subnet-a,chonky-subnet-b" \
-    --region "$REGION" \
-    --query 'Subnets[*].SubnetId' \
-    --output text | tr '\t' ',')
-
-if [ -z "$SUBNET_IDS" ]; then
-    die "Could not find private subnets in VPC $VPC_ID"
-fi
-
-SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
-    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=chonky-lambda-sg" \
-    --region "$REGION" \
-    --query 'SecurityGroups[0].GroupId' \
-    --output text)
-
-if [ -z "$SECURITY_GROUP_ID" ] || [ "$SECURITY_GROUP_ID" = "None" ]; then
-    log "Security group chonky-lambda-sg not found, creating it..."
-    SECURITY_GROUP_ID=$(aws ec2 create-security-group \
-        --group-name chonky-lambda-sg \
-        --description "Security group for ChonkyChonk Lambda functions" \
-        --vpc-id "$VPC_ID" \
-        --region "$REGION" \
-        --query 'GroupId' \
-        --output text)
-    
-    log "Created security group: $SECURITY_GROUP_ID"
-    
-    # Tag it
-    aws ec2 create-tags \
-        --resources "$SECURITY_GROUP_ID" \
-        --tags "Key=Name,Value=chonky-lambda-sg" \
-        --region "$REGION"
-    
-    # Get the RDS security group ID
-    DB_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
-        --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=chonky-db-sg" \
-        --region "$REGION" \
-        --query 'SecurityGroups[0].GroupId' \
-        --output text)
-    
-    if [ -z "$DB_SECURITY_GROUP_ID" ] || [ "$DB_SECURITY_GROUP_ID" = "None" ]; then
-        die "Could not find RDS security group chonky-db-sg"
+log "Verifying DynamoDB tables exist in $REGION..."
+for TABLE in \
+    "$USERS_TABLE_NAME" \
+    "$PRODUCTS_TABLE_NAME" \
+    "$ORDERS_TABLE_NAME" \
+    "$PAYMENTS_TABLE_NAME" \
+    "$PROMOTIONS_TABLE_NAME"
+do
+    if ! aws dynamodb describe-table --table-name "$TABLE" --region "$REGION" >/dev/null 2>&1; then
+        die "DynamoDB table '$TABLE' not found in $REGION. Has the terraform for this environment been applied? Does NAME_PREFIX ('$NAME_PREFIX') match your terraform's name_prefix variable?"
     fi
-    
-    # Allow egress from Lambda to RDS on port 5432
-    log "Configuring security group rules..."
-    aws ec2 authorize-security-group-egress \
-        --group-id "$SECURITY_GROUP_ID" \
-        --protocol tcp \
-        --port 5432 \
-        --source-group "$DB_SECURITY_GROUP_ID" \
-        --region "$REGION" 2>/dev/null || warn "Egress rule may already exist"
-    
-    # Allow RDS to accept from Lambda
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$DB_SECURITY_GROUP_ID" \
-        --protocol tcp \
-        --port 5432 \
-        --source-group "$SECURITY_GROUP_ID" \
-        --region "$REGION" 2>/dev/null || warn "Ingress rule may already exist"
-fi
+    log "  found: $TABLE"
+done
 
-log "VPC configuration:"
-log "  VPC ID: $VPC_ID"
-log "  Subnets: $SUBNET_IDS"
-log "  Security Group: $SECURITY_GROUP_ID"
+# ==============================================================================
+# RDS / VPC — REMOVED.
+#
+# All six lambdas (users, products, orders, payments_api, stripe_webhook,
+# email_service) are migrated to DynamoDB, so there is no longer any Lambda
+# in this stack that needs VpcConfig or DB_HOST/DB_USER/DB_NAME/DB_PORT/
+# DBPasswordSecretName/VpcId/SubnetIds/SecurityGroupId. This script no
+# longer fetches an RDS endpoint, VPC, subnets, or security group, and no
+# longer passes any of those as deploy parameters.
+#
+# This assumes template.yaml has also dropped VpcConfig and the RDS/VPC
+# Parameters from every function. If template.yaml still declares any of
+# them as required (no default), `sam deploy` below will fail asking for
+# values this script no longer provides — that's your signal to go finish
+# editing the template, not to re-add this block.
+#
+# Once you've confirmed the RDS instance, its security group, and the VPC
+# (if nothing else in the account still uses them) are no longer needed,
+# they can be decommissioned in AWS directly — this script never created
+# them, so it can't clean them up for you.
+# ==============================================================================
 
 # S3 bucket for SAM artifacts
 S3_BUCKET="chonkychonk-sam-artifacts-${ENVIRONMENT}"
@@ -160,7 +135,6 @@ fi
 # ==============================================================================
 
 log "Building lambda package..."
-# sam build -t template.products.yaml
 sam build
 
 # ==============================================================================
@@ -193,17 +167,19 @@ if [[ "$STACK_STATUS" == "UPDATE_ROLLBACK_FAILED" ]]; then
 fi
 
 # Build parameter overrides for all required parameters
+#
+# NOTE: this list is now DynamoDB table names + Stripe/dev-email config
+# only. No DBHost/DBPort/DBUser/DBName/VpcId/SubnetIds/SecurityGroupId/
+# DBPasswordSecretName — those are gone along with RDS. If template.yaml
+# still lists any of them as Parameters, `sam deploy` will fail demanding a
+# value; go drop them from the template rather than adding them back here.
 PARAM_OVERRIDES=(
-  "ParameterKey=DBHost,ParameterValue=$DB_HOST"
-  "ParameterKey=DBPort,ParameterValue=$DB_PORT"
-  "ParameterKey=DBUser,ParameterValue=$DB_USER"
-  "ParameterKey=DBName,ParameterValue=$DB_NAME"
-  "ParameterKey=VpcId,ParameterValue=$VPC_ID"
-  "ParameterKey=SubnetIds,ParameterValue=$SUBNET_IDS"
-  "ParameterKey=SecurityGroupId,ParameterValue=$SECURITY_GROUP_ID"
-  "ParameterKey=DBPasswordSecretName,ParameterValue=chonky/${ENVIRONMENT}/db_pass"
+  "ParameterKey=UsersTableName,ParameterValue=$USERS_TABLE_NAME"
+  "ParameterKey=ProductsTableName,ParameterValue=$PRODUCTS_TABLE_NAME"
+  "ParameterKey=OrdersTableName,ParameterValue=$ORDERS_TABLE_NAME"
+  "ParameterKey=PaymentsTableName,ParameterValue=$PAYMENTS_TABLE_NAME"
+  "ParameterKey=PromotionsTableName,ParameterValue=$PROMOTIONS_TABLE_NAME"
   "ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key"
-  "ParameterKey=SSHPrivateKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/ssh_private_key"
   "ParameterKey=DevEmail,ParameterValue=$DEV_EMAIL"
 )
 

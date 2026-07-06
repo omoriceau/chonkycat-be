@@ -76,7 +76,9 @@ class ResolvedOrder:
     shipping_amount:  Decimal
     discount_amount:  Decimal
     total_amount:     Decimal
-    promotion_id:     Optional[int]
+    # NOTE: the promotions table's key is the code itself (no surrogate id in
+    # the new schema), so this now holds the normalized code string, not an int.
+    promotion_id:     Optional[str]
     promotion_code:   Optional[str]
     customer_notes:   Optional[str]
     currency:         str

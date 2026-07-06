@@ -11,11 +11,14 @@ Routes:
   DELETE /users/{userId}   Delete a user
 
 Environment Variables:
-  - DB_HOST                  PostgreSQL RDS endpoint
-  - DB_PORT                  PostgreSQL port (default: 5432)
-  - DB_USER                  Database user
-  - DB_NAME                  Database name
-  - DB_PASSWORD_SECRET_NAME  Name of AWS Secrets Manager secret for DB password
+  - USERS_TABLE_NAME   DynamoDB table name (aws_dynamodb_table.users.name)
+  - EVENT_BUS_NAME     EventBridge bus for the UserCreated event (optional,
+                        defaults to "chonkychonk-bus")
+
+NOTE: user IDs used to be sequential integers (Postgres SERIAL). They are
+now randomly generated UUID strings, since DynamoDB has no auto-increment
+primary key. Any client that parsed userId as an int needs to change to
+treat it as an opaque string.
 
 Example create request body:
 {
@@ -92,8 +95,12 @@ def lambda_handler(event: dict, context) -> dict:
         return err(f"Unsupported HTTP method: {method}", status=405)
 
 
-def _parse_user_id(event: dict) -> int:
-    return int(event["pathParameters"]["userId"])
+def _parse_user_id(event: dict) -> str:
+    """user_id is now a UUID string, not an int — just validate it's present."""
+    user_id = event["pathParameters"]["userId"]
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("empty userId")
+    return user_id
 
 
 def _handle_get_user(event: dict) -> dict:

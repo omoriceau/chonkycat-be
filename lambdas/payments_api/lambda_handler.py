@@ -6,17 +6,26 @@ Entry point: POST /payments
 Accepts an existing order_id and creates a Stripe payment intent for it.
 
 Environment Variables:
-  - DB_HOST              PostgreSQL RDS endpoint
-  - DB_PORT              PostgreSQL port (default: 5432)
-  - DB_USER              Database user
-  - DB_NAME              Database name
-  - DB_PASSWORD_SECRET_NAME  Name of AWS Secrets Manager secret for DB password
+  - ORDERS_TABLE_NAME    DynamoDB orders table name
+  - USERS_TABLE_NAME     DynamoDB users table name
+  - PAYMENTS_TABLE_NAME  DynamoDB payments table name
   - EVENT_BUS_NAME       EventBridge bus name (default: chonkychonk-bus)
   - STRIPE_INTENT_FUNCTION_ARN  ARN of the Stripe Intent Lambda
 
+NOTE: order_id is now a UUID string (DynamoDB has no auto-increment PK),
+not an int like the old Postgres serial id. The request body field is
+unchanged in shape — just don't assume it parses as an int anymore.
+
+NOTE ON THE payments TABLE: the original RDS version of this lambda never
+wrote a payments row at all — it only read orders/users and called out to
+Stripe. This version adds a payment record (order_id / sk="PAYMENT#<intent_id>")
+after the Stripe intent is created, so the payments table's ProviderTxnIndex
+GSI (declared in terraform for "the future Stripe webhook handler") is
+actually populated. See the matching change in stripe_webhook.
+
 Example request body:
 {
-    "order_id": 123
+    "order_id": "9d2982e4-2a45-433b-b38e-8dba0a51a3e0"
 }
 """
 
@@ -76,60 +85,26 @@ def err(message: str, status: int = 400) -> dict:
 # Order retrieval
 # ---------------------------------------------------------------------------
 
-def get_order_with_items(db, order_id: int) -> dict:
-    """Fetch order and its items by order_id."""
-    logger.info("81 get_order_with_items: order_id=%s", order_id)
+def get_order(db, order_id: str) -> dict:
+    """Fetch the order record by order_id."""
+    logger.info("get_order: order_id=%s", order_id)
 
-    # Fetch order
-    order = db.fetch_one(
-        """
-        SELECT id, user_id, status, total_amount, subtotal, tax_amount, shipping_amount
-        FROM orders
-        WHERE id = %s AND deleted_at IS NULL
-        """,
-        (order_id,)
-    )
-
+    order = db.get_order(order_id)
     if not order:
         raise ValueError(f"Order {order_id} not found")
 
-    logger.info("96 get_order_with_items: order found, fetching items")
-
-    # Fetch order items
-    items = db.fetch_all(
-        """
-        SELECT product_id, quantity, unit_price, line_total, name_snapshot
-        FROM order_items
-        WHERE order_id = %s
-        """,
-        (order_id,)
-    )
-
-    logger.info("108 get_order_with_items: found %d item(s)", len(items))
-
-    return {
-        "order": order,
-        "items": items,
-    }
+    logger.info("get_order: found, status=%s", order.get("status"))
+    return order
 
 
-def get_user_email(db, user_id: int) -> str:
+def get_user_email(db, user_id: str) -> str:
     """Fetch user email by user_id."""
     logger.info("get_user_email: user_id=%s", user_id)
 
-    row = db.fetch_one(
-        """
-        SELECT email
-        FROM users
-        WHERE id = %s
-        """,
-        (user_id,)
-    )
-
-    if not row:
+    email = db.get_user_email(user_id)
+    if not email:
         raise ValueError(f"User {user_id} not found")
 
-    email = row["email"]
     logger.info("get_user_email: email=%s", email)
     return email
 
@@ -151,7 +126,7 @@ def emit_event(detail_type: str, detail: dict):
     except ClientError as e:
         logger.exception("EventBridge failure: %s", e)
 
-def create_stripe_intent(amount: int, currency: str, order_id: int, email: str) -> dict:
+def create_stripe_intent(amount: int, currency: str, order_id: str, email: str) -> dict:
     logger.info("invoking StripeIntentFunction: amount=%s currency=%s order_id=%s", amount, currency, order_id)
 
     response = _lambda.invoke(
@@ -174,7 +149,7 @@ def create_stripe_intent(amount: int, currency: str, order_id: int, email: str) 
         raise Exception(f"Stripe Lambda failed: {payload}")
 
     return payload
-    
+
 # ---------------------------------------------------------------------------
 # Core handler
 # ---------------------------------------------------------------------------
@@ -213,16 +188,11 @@ def lambda_handler(event, context):
             logger.warning("missing order_id")
             return err("order_id is required", status=422)
 
-        try:
-            order_id = int(order_id)
-        except (ValueError, TypeError):
-            logger.warning("invalid order_id format: %s", order_id)
-            return err("order_id must be an integer", status=422)
+        order_id = str(order_id)
 
         logger.info("retrieving order: order_id=%s", order_id)
         db = get_db_client()
-        order_data = get_order_with_items(db, order_id)
-        order = order_data["order"]
+        order = get_order(db, order_id)
         email = get_user_email(db, order["user_id"])
 
         logger.info("order retrieved: status=%s total_amount=%s", order["status"], order["total_amount"])
@@ -243,6 +213,22 @@ def lambda_handler(event, context):
             email=email,
         )
         logger.info("stripe result: %s", stripe_result)
+
+        # Record the payment attempt so the webhook can look it up later via
+        # ProviderTxnIndex (see db.py docstring).
+        try:
+            db.create_payment_record(
+                order_id=order_id,
+                intent_id=stripe_result["intent_id"],
+                status="pending",
+                amount=str(total),
+                currency=currency,
+            )
+        except Exception:
+            # Don't fail the request over this — the intent already exists on
+            # Stripe's side and the frontend has its client_secret. Worst
+            # case, the webhook won't find a payment record to update later.
+            logger.exception("Failed to write payment record for order_id=%s", order_id)
 
         emit_event("PaymentIntentCreated", {
             "order_id": order_id,

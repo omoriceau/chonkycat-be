@@ -2,19 +2,20 @@
 users/service.py
 
 UserService handles:
-  - Create / read / update / delete of public.users rows
-  - Email uniqueness enforcement (mirrors the UNIQUE constraint in Postgres)
-  - Pagination for list endpoint
+  - Create / read / update / delete of users in DynamoDB
+  - Email uniqueness enforcement (via the lock-item pattern in db.py —
+    mirrors the UNIQUE constraint Postgres used to give us for free)
+  - Pagination for the list endpoint
   - EventBridge: UserCreated (-> Email Lambda, sends a welcome email)
 """
 
 import json
 import logging
 import os
+import uuid
 from typing import Optional
 
 import boto3
-import psycopg2.errors
 from botocore.exceptions import ClientError
 
 from models import (
@@ -24,12 +25,6 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Columns returned to the client — never expose internal-only columns here
-_USER_COLUMNS = (
-    "id, email, first_name, last_name, phone, role, status, "
-    "created_at, updated_at"
-)
 
 # ---------------------------------------------------------------------------
 # EventBridge
@@ -44,114 +39,99 @@ USER_CREATED = "UserCreated"
 
 EVENTBRIDGE_BUS = os.environ.get("EVENT_BUS_NAME", "chonkychonk-bus")
 
+# DynamoDB has no auto-increment PK like the old `id SERIAL`. Every user now
+# gets a random UUID as its user_id — this is a visible API change for any
+# caller that assumed integer, sequential user IDs.
+_DEFAULT_LIMIT = 50
+_MAX_LIMIT = 200
+
 
 class UserService:
 
     def __init__(self, db_client=None, events_client=None):
-        from db import PostgreSQLClient
-        self._db     = db_client     or PostgreSQLClient()
+        from db import get_db_client, EmailAlreadyExists, now_iso
+        self._db = db_client or get_db_client()
         self._events = events_client or boto3.client("events")
+        self._EmailAlreadyExists = EmailAlreadyExists
+        self._now_iso = now_iso
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
-    def get_user(self, user_id: int) -> Optional[dict]:
-        sql = f"SELECT {_USER_COLUMNS} FROM users WHERE id = $1"
-        resp = self._execute(
-            sql,
-            [{"name": "user_id", "value": {"longValue": user_id}}],
-            "get_user",
-            include_metadata=True,
-        )
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
-        return self._to_response(rows[0]) if rows else None
+    def get_user(self, user_id: str) -> Optional[dict]:
+        item = self._db.get_user(user_id)
+        return self._to_response(item) if item else None
 
     def list_users(self, limit: int = 50, offset: int = 0,
                     role: Optional[str] = None,
                     status: Optional[str] = None) -> dict:
         """
         Paginated user listing, optionally filtered by role/status.
+
+        NOTE: DynamoDB has no OFFSET/LIMIT like SQL. To keep the existing
+        limit/offset API contract, this pulls every matching item (Scan,
+        filtered server-side by role/status), sorts by created_at ascending
+        (the closest equivalent to the old "ORDER BY id ASC" — since ids
+        are now random UUIDs, not sequential, they carry no useful order),
+        then slices in memory. Fine for a user base up to the low tens of
+        thousands; if it grows much larger, switch this endpoint to
+        cursor-based (LastEvaluatedKey) pagination instead.
         """
-        limit = max(1, min(limit, 200))
+        limit = max(1, min(limit, _MAX_LIMIT))
         offset = max(0, offset)
 
-        where_clauses = []
-        params = []
-        idx = 1
+        items = self._db.list_users(role=role, status=status)
+        items.sort(key=lambda i: i.get("created_at", ""))
 
-        if role:
-            where_clauses.append(f"role = ${idx}")
-            params.append({"name": "role", "value": {"stringValue": role}})
-            idx += 1
-        if status:
-            where_clauses.append(f"status = ${idx}")
-            params.append({"name": "status", "value": {"stringValue": status}})
-            idx += 1
-
-        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        sql = f"""
-            SELECT {_USER_COLUMNS}
-            FROM   users
-            {where_sql}
-            ORDER BY id ASC
-            LIMIT  ${idx} OFFSET ${idx + 1}
-        """
-        params.append({"name": "limit", "value": {"longValue": limit}})
-        params.append({"name": "offset", "value": {"longValue": offset}})
-
-        resp = self._execute(sql, params, "list_users", include_metadata=True)
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
+        page = items[offset:offset + limit]
 
         return {
-            "users":  [self._to_response(r) for r in rows],
+            "users":  [self._to_response(i) for i in page],
             "limit":  limit,
             "offset": offset,
-            "count":  len(rows),
+            "count":  len(page),
         }
 
     def create_user(self, request: CreateUserRequest) -> dict:
-        sql = """
-            INSERT INTO users (email, first_name, last_name, phone, role, status)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, email, first_name, last_name, phone, role, status,
-                      created_at, updated_at
-        """
-        params = [
-            {"name": "email",      "value": {"stringValue": request.email}},
-            {"name": "first_name", "value": {"stringValue": request.first_name} if request.first_name else {"isNull": True}},
-            {"name": "last_name",  "value": {"stringValue": request.last_name} if request.last_name else {"isNull": True}},
-            {"name": "phone",      "value": {"stringValue": request.phone} if request.phone else {"isNull": True}},
-            {"name": "role",       "value": {"stringValue": request.role}},
-            {"name": "status",     "value": {"stringValue": request.status}},
-        ]
+        user_id = str(uuid.uuid4())
+        created_at = self._now_iso()
+
+        user_item = {
+            "user_id": user_id,
+            "email": request.email,
+            "first_name": request.first_name,
+            "last_name": request.last_name,
+            "phone": request.phone,
+            "role": request.role,
+            "status": request.status,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        # DynamoDB item can't store `None` values in the way we want to read
+        # them back consistently — drop unset optional fields entirely.
+        user_item = {k: v for k, v in user_item.items() if v is not None}
 
         try:
-            resp = self._execute(sql, params, "create_user", include_metadata=True)
-        except psycopg2.errors.UniqueViolation:
+            self._db.create_user(user_item)
+        except self._EmailAlreadyExists:
             raise ValidationError(f"A user with email '{request.email}' already exists")
 
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
-        user = self._to_response(rows[0])
+        user = self._to_response(user_item)
         logger.info("User created | email=%s", request.email)
 
         self._emit_user_created(user)
 
         return user
 
-    def update_user(self, user_id: int, update: UpdateUserRequest) -> Optional[dict]:
+    def update_user(self, user_id: str, update: UpdateUserRequest) -> Optional[dict]:
         # Confirm the user exists first
-        existing = self.get_user(user_id)
+        existing = self._db.get_user(user_id)
         if existing is None:
             return None
 
-        fields = []
-        params = []
-        idx = 1
-
+        updates = {}
         for column, value in (
-            ("email", update.email),
             ("first_name", update.first_name),
             ("last_name", update.last_name),
             ("phone", update.phone),
@@ -159,47 +139,35 @@ class UserService:
             ("status", update.status),
         ):
             if value is not None:
-                fields.append(f"{column} = ${idx}")
-                params.append({"name": column, "value": {"stringValue": value}})
-                idx += 1
+                updates[column] = value
 
-        fields.append("updated_at = CURRENT_TIMESTAMP")
-
-        sql = f"""
-            UPDATE users
-            SET    {', '.join(fields)}
-            WHERE  id = ${idx}
-            RETURNING id, email, first_name, last_name, phone, role, status,
-                      created_at, updated_at
-        """
-        params.append({"name": "user_id", "value": {"longValue": user_id}})
+        new_email = update.email if update.email is not None else None
 
         try:
-            resp = self._execute(sql, params, "update_user", include_metadata=True)
-        except psycopg2.errors.UniqueViolation:
+            item = self._db.update_user(
+                user_id,
+                updates,
+                current_email=existing["email"],
+                new_email=new_email,
+            )
+        except self._EmailAlreadyExists:
             raise ValidationError(f"A user with email '{update.email}' already exists")
 
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
         logger.info("User updated | user_id=%s", user_id)
-        return self._to_response(rows[0])
+        return self._to_response(item)
 
-    def delete_user(self, user_id: int) -> bool:
+    def delete_user(self, user_id: str) -> bool:
         """
-        Hard delete — the users table has no deleted_at column.
-        If soft-delete is preferred, switch this to `UPDATE users SET status='inactive'`.
+        Hard delete — matches the old RDS behaviour (no soft-delete column).
         """
-        sql = "DELETE FROM users WHERE id = $1 RETURNING id"
-        resp = self._execute(
-            sql,
-            [{"name": "user_id", "value": {"longValue": user_id}}],
-            "delete_user",
-            include_metadata=True,
-        )
-        rows = self._to_dicts(resp["columnMetadata"], resp["records"])
-        if rows:
+        existing = self._db.get_user(user_id)
+        if existing is None:
+            return False
+
+        deleted = self._db.delete_user(user_id, email=existing["email"])
+        if deleted:
             logger.info("User deleted | user_id=%s", user_id)
-            return True
-        return False
+        return deleted
 
     # ------------------------------------------------------------------
     # EventBridge
@@ -235,40 +203,16 @@ class UserService:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _execute(self, sql: str, params: list, label: str, include_metadata: bool = False) -> dict:
-        try:
-            return self._db.execute_statement(
-                sql=sql,
-                parameters=params,
-                includeResultMetadata=include_metadata,
-            )
-        except psycopg2.errors.UniqueViolation:
-            raise
-        except Exception as e:
-            logger.error("DB error [%s]: %s", label, e)
-            raise
-
     @staticmethod
-    def _to_dicts(column_metadata: list, records: list) -> list[dict]:
-        columns = [col["name"] for col in column_metadata]
-        result = []
-        for record in records:
-            row = {}
-            for col, field in zip(columns, record):
-                row[col] = next(iter(field.values())) if field != {"isNull": True} else None
-            result.append(row)
-        return result
-
-    @staticmethod
-    def _to_response(row: dict) -> dict:
+    def _to_response(item: dict) -> dict:
         return {
-            "id":         row["id"],
-            "email":      row["email"],
-            "first_name": row["first_name"],
-            "last_name":  row["last_name"],
-            "phone":      row["phone"],
-            "role":       row["role"],
-            "status":     row["status"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
+            "id":         item.get("user_id"),
+            "email":      item.get("email"),
+            "first_name": item.get("first_name"),
+            "last_name":  item.get("last_name"),
+            "phone":      item.get("phone"),
+            "role":       item.get("role"),
+            "status":     item.get("status"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
         }
