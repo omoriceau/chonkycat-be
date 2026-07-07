@@ -44,6 +44,18 @@ TEST_PRODUCT_IDS=("00000000-0000-0000-0000-000000000001" "00000000-0000-0000-000
 TEST_ORDER_ID="00000000-0000-0000-0000-000000000000"
 CREATED_ORDER_IDS=()  # order ids created live by the orders-create test, cleaned up too
 
+# Product-scenario test IDs. ProductsFunction is read-only (GET /products,
+# GET /products/{productid}) - there's no create/update/delete API for
+# products yet - so "add" / "soft delete" / "edit price" are simulated by
+# seeding (and, for edit-price, later mutating) rows directly in DynamoDB,
+# then asserting the read paths reflect the expected state.
+PRODUCT_ADDED_ID="00000000-0000-0000-0000-000000000010"
+PRODUCT_SOFT_DELETED_ID="00000000-0000-0000-0000-000000000011"
+PRODUCT_LOW_STOCK_ID="00000000-0000-0000-0000-000000000012"
+PRODUCT_NO_STOCK_ID="00000000-0000-0000-0000-000000000013"
+PRODUCT_EDIT_PRICE_ID="00000000-0000-0000-0000-000000000014"
+PRODUCT_SCENARIO_IDS=("$PRODUCT_ADDED_ID" "$PRODUCT_SOFT_DELETED_ID" "$PRODUCT_LOW_STOCK_ID" "$PRODUCT_NO_STOCK_ID" "$PRODUCT_EDIT_PRICE_ID")
+
 SKIP_BUILD=false
 FILTER=""
 for arg in "$@"; do
@@ -101,6 +113,63 @@ seed_data() {
     }' || die "Failed to seed test product $PID"
   done
 
+  aws dynamodb put-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" --item '{
+    "product_id": {"S": "'"$PRODUCT_ADDED_ID"'"},
+    "sku": {"S": "TEST-ADD-1"},
+    "name": {"S": "Freshly Added Product"},
+    "category": {"S": "test-category"},
+    "price": {"N": "24.99"},
+    "qty": {"N": "50"},
+    "low_stock_threshold": {"N": "10"},
+    "active": {"BOOL": true}
+  }' || die "Failed to seed products-add fixture"
+
+  aws dynamodb put-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" --item '{
+    "product_id": {"S": "'"$PRODUCT_SOFT_DELETED_ID"'"},
+    "sku": {"S": "TEST-DEL-1"},
+    "name": {"S": "Soft Deleted Product"},
+    "category": {"S": "test-category"},
+    "price": {"N": "15.00"},
+    "qty": {"N": "20"},
+    "low_stock_threshold": {"N": "5"},
+    "active": {"BOOL": false}
+  }' || die "Failed to seed products-soft-delete fixture"
+
+  aws dynamodb put-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" --item '{
+    "product_id": {"S": "'"$PRODUCT_LOW_STOCK_ID"'"},
+    "sku": {"S": "TEST-LOW-1"},
+    "name": {"S": "Low Stock Product"},
+    "category": {"S": "test-category"},
+    "price": {"N": "8.50"},
+    "qty": {"N": "3"},
+    "low_stock_threshold": {"N": "5"},
+    "reorder_flag": {"S": "true"},
+    "active": {"BOOL": true}
+  }' || die "Failed to seed products-low-stock fixture"
+
+  aws dynamodb put-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" --item '{
+    "product_id": {"S": "'"$PRODUCT_NO_STOCK_ID"'"},
+    "sku": {"S": "TEST-OOS-1"},
+    "name": {"S": "Out Of Stock Product"},
+    "category": {"S": "test-category"},
+    "price": {"N": "12.00"},
+    "qty": {"N": "0"},
+    "low_stock_threshold": {"N": "5"},
+    "reorder_flag": {"S": "true"},
+    "active": {"BOOL": true}
+  }' || die "Failed to seed products-no-stock fixture"
+
+  aws dynamodb put-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" --item '{
+    "product_id": {"S": "'"$PRODUCT_EDIT_PRICE_ID"'"},
+    "sku": {"S": "TEST-EDIT-1"},
+    "name": {"S": "Edit Price Product"},
+    "category": {"S": "test-category"},
+    "price": {"N": "9.99"},
+    "qty": {"N": "40"},
+    "low_stock_threshold": {"N": "5"},
+    "active": {"BOOL": true}
+  }' || die "Failed to seed products-edit-price fixture"
+
   NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   aws dynamodb put-item --region "$REGION" --table-name "$ORDERS_TABLE_NAME" --item '{
     "order_id": {"S": "'"$TEST_ORDER_ID"'"},
@@ -149,6 +218,11 @@ cleanup_seed_data() {
   done
 
   for PID in "${TEST_PRODUCT_IDS[@]}"; do
+    aws dynamodb delete-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" \
+      --key '{"product_id": {"S": "'"$PID"'"}}' >/dev/null 2>&1
+  done
+
+  for PID in "${PRODUCT_SCENARIO_IDS[@]}"; do
     aws dynamodb delete-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" \
       --key '{"product_id": {"S": "'"$PID"'"}}' >/dev/null 2>&1
   done
@@ -298,6 +372,176 @@ for entry in "${TESTS[@]}"; do
 
   PASS=$((PASS + 1))
 done
+
+# ==============================================================================
+# Product scenario tests — ProductsFunction only exposes GET /products and
+# GET /products/{productid} (see template.yaml). There's no create/update/
+# delete API for products, so "add" / "soft delete" / "edit price" are
+# simulated by seeding (and, for edit-price, later mutating) rows directly
+# in DynamoDB in seed_data() above, and these tests assert the read paths
+# reflect the expected state — unlike the generic loop above, which only
+# checks that the Lambda ran without throwing.
+# ==============================================================================
+
+invoke_products() {
+  # $1 = event file. Sets RESP_STATUS / RESP_BODY on success.
+  local EVENT_FILE="$1"
+  local LOG_FILE="$LOG_DIR/$(basename "$EVENT_FILE").log"
+  local OUTPUT EXIT_CODE RESPONSE_LINE
+  OUTPUT="$(sam local invoke "ProductsFunction" \
+    -e "$EVENT_FILE" \
+    --region "$REGION" \
+    --parameter-overrides "$PARAM_OVERRIDES" \
+    --env-vars "$ENV_VARS_FILE" 2>"$LOG_FILE")"
+  EXIT_CODE=$?
+  RESPONSE_LINE="$(echo "$OUTPUT" | tail -n 1)"
+
+  if [ $EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}  ✗${NC} sam local invoke exited $EXIT_CODE"
+    tail -n 15 "$LOG_FILE"
+    return 1
+  fi
+  if ! echo "$RESPONSE_LINE" | jq -e . >/dev/null 2>&1; then
+    echo -e "${RED}  ✗${NC} response wasn't valid JSON: $RESPONSE_LINE"
+    return 1
+  fi
+  if echo "$RESPONSE_LINE" | jq -e '.errorMessage' >/dev/null 2>&1; then
+    echo -e "${RED}  ✗${NC} unhandled exception in Lambda:"
+    echo "$RESPONSE_LINE" | jq .
+    return 1
+  fi
+
+  RESP_STATUS="$(echo "$RESPONSE_LINE" | jq -r '.statusCode // "n/a"')"
+  RESP_BODY="$(echo "$RESPONSE_LINE" | jq -r '.body // empty')"
+  return 0
+}
+
+check_status() {
+  local desc="$1" expected="$2"
+  if [ "$RESP_STATUS" = "$expected" ]; then
+    echo -e "${GREEN}  ✓${NC} $desc"
+    return 0
+  fi
+  echo -e "${RED}  ✗${NC} $desc (expected statusCode $expected, got $RESP_STATUS)"
+  return 1
+}
+
+check_body() {
+  local desc="$1" filter="$2"
+  if echo "$RESP_BODY" | jq -e "$filter" >/dev/null 2>&1; then
+    echo -e "${GREEN}  ✓${NC} $desc"
+    return 0
+  fi
+  echo -e "${RED}  ✗${NC} $desc"
+  echo "$RESP_BODY" | jq . 2>/dev/null || echo "$RESP_BODY"
+  return 1
+}
+
+test_products_add() {
+  invoke_products "events/products-get-added.json" || return 1
+  local rc=0
+  check_status "GET /products/{id} returns 200"           200 || rc=1
+  check_body   "id matches the seeded fixture"            ".data.id == \"$PRODUCT_ADDED_ID\"" || rc=1
+  check_body   "name matches the seeded fixture"          '.data.name == "Freshly Added Product"' || rc=1
+  check_body   "price matches the seeded fixture"         '.data.price == 24.99' || rc=1
+  check_body   "product is active"                        '.data.active == true' || rc=1
+
+  invoke_products "events/products-list.json" || return 1
+  check_body "newly added product appears in the default catalog listing" \
+    "[.data[].id] | index(\"$PRODUCT_ADDED_ID\") != null" || rc=1
+
+  return $rc
+}
+
+test_products_soft_delete() {
+  invoke_products "events/products-list.json" || return 1
+  local rc=0
+  check_body "soft-deleted product is hidden from the default (active-only) listing" \
+    "([.data[].id] | index(\"$PRODUCT_SOFT_DELETED_ID\")) == null" || rc=1
+
+  invoke_products "events/products-list-show-all.json" || return 1
+  check_body "soft-deleted product reappears when show_all=true" \
+    "[.data[].id] | index(\"$PRODUCT_SOFT_DELETED_ID\") != null" || rc=1
+
+  invoke_products "events/products-get-soft-deleted.json" || return 1
+  check_status "GET /products/{id} still returns 200 for a soft-deleted product" 200 || rc=1
+  check_body   "direct lookup reports active: false"                             '.data.active == false' || rc=1
+
+  return $rc
+}
+
+test_products_low_stock() {
+  invoke_products "events/products-get-low-stock.json" || return 1
+  local rc=0
+  check_body "current_stock reflects the seeded low quantity" '.data.current_stock == 3' || rc=1
+  check_body "is_low_stock is true when qty <= threshold"     '.data.is_low_stock == true' || rc=1
+
+  invoke_products "events/products-list-low-stock.json" || return 1
+  check_body "low-stock product appears under ?low_stock=true" \
+    "[.data[].id] | index(\"$PRODUCT_LOW_STOCK_ID\") != null" || rc=1
+
+  return $rc
+}
+
+test_products_no_stock() {
+  invoke_products "events/products-get-no-stock.json" || return 1
+  local rc=0
+  check_body "current_stock is 0"             '.data.current_stock == 0' || rc=1
+  check_body "zero stock counts as low stock" '.data.is_low_stock == true' || rc=1
+
+  invoke_products "events/products-list-low-stock.json" || return 1
+  check_body "out-of-stock product appears under ?low_stock=true" \
+    "[.data[].id] | index(\"$PRODUCT_NO_STOCK_ID\") != null" || rc=1
+
+  invoke_products "events/products-list.json" || return 1
+  check_body "out-of-stock product still shows in the default catalog listing (no auto-hide on qty=0)" \
+    "[.data[].id] | index(\"$PRODUCT_NO_STOCK_ID\") != null" || rc=1
+
+  return $rc
+}
+
+test_products_edit_price() {
+  invoke_products "events/products-get-edit-price.json" || return 1
+  local rc=0
+  check_body "price before edit matches the seeded value" '.data.price == 9.99' || rc=1
+
+  if ! aws dynamodb update-item --region "$REGION" --table-name "$PRODUCTS_TABLE_NAME" \
+    --key '{"product_id": {"S": "'"$PRODUCT_EDIT_PRICE_ID"'"}}' \
+    --update-expression 'SET price = :p' \
+    --expression-attribute-values '{":p": {"N": "14.99"}}' >/dev/null; then
+    echo -e "${RED}  ✗${NC} failed to apply price edit via update-item"
+    return 1
+  fi
+
+  invoke_products "events/products-get-edit-price.json" || return 1
+  check_body "price after edit reflects the new value" '.data.price == 14.99' || rc=1
+
+  return $rc
+}
+
+run_product_test() {
+  local LABEL="$1" TEST_FN="$2"
+  if [ -n "$FILTER" ] && [[ "$LABEL" != *"$FILTER"* ]]; then
+    SKIP=$((SKIP + 1))
+    return
+  fi
+
+  echo ""
+  echo "=== $LABEL ==="
+  if "$TEST_FN"; then
+    echo -e "${GREEN}✓ PASS${NC}"
+    PASS=$((PASS + 1))
+  else
+    echo -e "${RED}✗ FAIL${NC}"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_product_test "products-add"         test_products_add
+run_product_test "products-soft-delete" test_products_soft_delete
+run_product_test "products-low-stock"   test_products_low_stock
+run_product_test "products-no-stock"    test_products_no_stock
+run_product_test "products-edit-price"  test_products_edit_price
 
 echo ""
 echo "================================"
