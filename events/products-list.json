@@ -1,0 +1,10 @@
+{
+  "httpMethod": "GET",
+  "path": "/products",
+  "queryStringParameters": {
+    "page_size": "1000"
+  },
+  "headers": {
+    "X-User-Id": "1"
+  }
+}

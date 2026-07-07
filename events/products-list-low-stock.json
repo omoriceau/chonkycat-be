@@ -1,0 +1,11 @@
+{
+  "httpMethod": "GET",
+  "path": "/products",
+  "queryStringParameters": {
+    "low_stock": "true",
+    "page_size": "1000"
+  },
+  "headers": {
+    "X-User-Id": "1"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "httpMethod": "GET",
+  "path": "/products/00000000-0000-0000-0000-000000000011",
+  "pathParameters": {
+    "productid": "00000000-0000-0000-0000-000000000011"
+  },
+  "headers": {
+    "X-User-Id": "1"
+  }
+}
