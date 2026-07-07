@@ -1,12 +1,12 @@
 {
   "httpMethod": "PUT",
-  "path": "/orders/6",
+  "path": "/orders/00000000-0000-0000-0000-000000000000",
   "pathParameters": {
-    "orderId": "6"
+    "orderId": "00000000-0000-0000-0000-000000000000"
   },
   "headers": {
     "X-User-Id": "1",
     "Content-Type": "application/json"
   },
-  "body": "{\"items\": [{\"product_id\": 1, \"quantity\": 2}], \"customer_notes\": \"Updated notes\"}"
+  "body": "{\"items\": [{\"product_id\": \"5cefc246-9c78-5c86-a44a-d117640b079f\", \"quantity\": 2}], \"customer_notes\": \"Updated notes\"}"
 }

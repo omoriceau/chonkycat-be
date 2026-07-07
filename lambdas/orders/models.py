@@ -24,7 +24,7 @@ class ValidationError(Exception):
 
 @dataclass
 class OrderItemRequest:
-    product_id: int
+    product_id: str
     quantity:   int
 
 
@@ -41,7 +41,7 @@ class ShippingAddress:
 
 @dataclass
 class CreateOrderRequest:
-    user_id:          int
+    user_id:          str
     items:            list[OrderItemRequest]
     shipping:         ShippingAddress
     currency:         str            = "CAD"
@@ -58,7 +58,7 @@ class CreateOrderRequest:
 
 @dataclass
 class ResolvedOrderItem:
-    product_id:     int
+    product_id:     str
     name_snapshot:  str
     quantity:       int
     unit_price:     Decimal
@@ -67,7 +67,7 @@ class ResolvedOrderItem:
 
 @dataclass
 class ResolvedOrder:
-    user_id:          int
+    user_id:          str
     customer_email:   str
     items:            list[ResolvedOrderItem]
     shipping:         ShippingAddress
@@ -106,7 +106,7 @@ def parse_create_order_request(data: dict) -> CreateOrderRequest:
     items = []
     for i, item in enumerate(raw_items):
         try:
-            product_id = int(_require(item, "product_id"))
+            product_id = str(_require(item, "product_id"))
             quantity   = int(_require(item, "quantity"))
         except (TypeError, ValueError) as e:
             raise ValidationError(f"items[{i}]: {e}")
@@ -127,7 +127,7 @@ def parse_create_order_request(data: dict) -> CreateOrderRequest:
     )
 
     return CreateOrderRequest(
-        user_id          = int(_require(data, "user_id")),
+        user_id          = str(_require(data, "user_id")),
         customer_email   = str(_require(data, "customer_email")),
         items            = items,
         shipping         = shipping,
@@ -156,7 +156,7 @@ def parse_update_order_request(data: dict) -> dict:
         items = []
         for i, item in enumerate(raw_items):
             try:
-                product_id = int(_require(item, "product_id"))
+                product_id = str(_require(item, "product_id"))
                 quantity   = int(_require(item, "quantity"))
             except (TypeError, ValueError) as e:
                 raise ValidationError(f"items[{i}]: {e}")
