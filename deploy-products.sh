@@ -12,10 +12,88 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # ==============================================================================
-# Configuration
+# Argument parsing
+#
+# Usage: $0 [--environment dev|staging|prod] [--region REGION] [--dev-email EMAIL] [--cors]
+#
+# All flags are optional and order-independent. Both "--flag value" and
+# "--flag=value" forms are accepted. Run with --help for details.
 # ==============================================================================
 
-ENVIRONMENT="${1:-dev}"
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --environment, --env <dev|staging|prod>   Target environment (default: dev)
+  --region <region>                         AWS region (default: your AWS CLI's
+                                             configured default region, falling
+                                             back to us-east-1 with a warning)
+  --dev-email <email>                       DevEmail parameter (default: dev@example.com)
+  --cors                                    Enable permissive CORS (Access-Control-
+                                             Allow-Origin: *). Only allowed with
+                                             --environment dev.
+  -h, --help                                Show this help and exit
+
+Examples:
+  $0
+  $0 --environment staging --region eu-west-1
+  $0 --env dev --cors
+  $0 --environment=prod --region=us-east-1 --dev-email=alerts@chonkychonk.com
+EOF
+}
+
+ENVIRONMENT="dev"
+REGION_ARG=""
+DEV_EMAIL="dev@example.com"
+ALLOW_CORS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --environment=*|--env=*)
+      ENVIRONMENT="${1#*=}"
+      shift
+      ;;
+    --environment|--env)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      ENVIRONMENT="$2"
+      shift 2
+      ;;
+    --region=*)
+      REGION_ARG="${1#*=}"
+      shift
+      ;;
+    --region)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      REGION_ARG="$2"
+      shift 2
+      ;;
+    --dev-email=*)
+      DEV_EMAIL="${1#*=}"
+      shift
+      ;;
+    --dev-email)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      DEV_EMAIL="$2"
+      shift 2
+      ;;
+    --cors)
+      ALLOW_CORS=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown argument: '$1'. Run '$0 --help' for usage."
+      ;;
+  esac
+done
+
+# ==============================================================================
+# Configuration
+# ==============================================================================
 
 # REGION: resolved from your AWS CLI's configured default region if you
 # don't pass one explicitly, since that's more likely to match wherever
@@ -23,18 +101,16 @@ ENVIRONMENT="${1:-dev}"
 # Still double-check this against the region you applied the terraform in —
 # if `aws configure get region` returns nothing (no default set) this falls
 # back to us-east-1 and warns you.
-if [ -n "${2:-}" ]; then
-  REGION="$2"
+if [ -n "$REGION_ARG" ]; then
+  REGION="$REGION_ARG"
 else
   REGION="$(aws configure get region || true)"
   if [ -z "$REGION" ]; then
     REGION="us-east-1"
     warn "No region passed and no AWS CLI default region configured — falling back to us-east-1."
-    warn "Pass it explicitly if your DynamoDB tables live elsewhere: $0 $ENVIRONMENT <region>"
+    warn "Pass it explicitly if your DynamoDB tables live elsewhere: $0 --environment $ENVIRONMENT --region <region>"
   fi
 fi
-
-DEV_EMAIL="${3:-dev@example.com}"
 
 case "$ENVIRONMENT" in
   dev|staging|prod)
@@ -44,7 +120,19 @@ case "$ENVIRONMENT" in
     ;;
 esac
 
+# --cors is deliberately restricted to dev. Permissive CORS (Access-Control-
+# Allow-Origin: *) on a staging/prod API is an easy way to accidentally let
+# any website read authenticated responses cross-origin — if you need CORS
+# open in staging/prod for a real reason, do it explicitly in the template
+# for that environment rather than via this shortcut flag.
+if [ "$ALLOW_CORS" = true ] && [ "$ENVIRONMENT" != "dev" ]; then
+    die "--cors is only allowed with --environment dev (got '$ENVIRONMENT'). Refusing to deploy permissive CORS to staging/prod."
+fi
+
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
+if [ "$ALLOW_CORS" = true ]; then
+    warn "Permissive CORS enabled (--cors): Access-Control-Allow-Origin will be '*' for this deploy."
+fi
 
 # ==============================================================================
 # DynamoDB tables — all six lambdas are now fully migrated off RDS, so these
@@ -182,6 +270,14 @@ PARAM_OVERRIDES=(
   "ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key"
   "ParameterKey=DevEmail,ParameterValue=$DEV_EMAIL"
 )
+
+# --cors: passed through as a parameter override. This assumes
+# template.yaml declares an AllowCorsOrigin parameter and wires it into the
+# API Gateway Cors config / response headers — if it doesn't yet, this
+# override is a no-op and the template needs that parameter added.
+if [ "$ALLOW_CORS" = true ]; then
+  PARAM_OVERRIDES+=("ParameterKey=AllowCorsOrigin,ParameterValue=*")
+fi
 
 sam deploy \
     --template-file .aws-sam/build/template.yaml \
