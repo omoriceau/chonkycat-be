@@ -519,12 +519,24 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /users
             Method: GET
+        # Self-service profile routes — a signed-in shopper viewing/editing
+        # their own profile (see Profile.jsx). Behind the same customer
+        # Cognito authorizer as POST /cart/claim (HasCustomerCognitoPool
+        # condition on ServerlessRestApi); lambda_handler.py additionally
+        # checks the caller's verified sub matches the {userId} in the
+        # path, so nobody can read/edit anyone else's profile just by
+        # knowing their id. GetUsers/PostUsers/DeleteUser are unrelated
+        # admin operations and stay as they were.
         GetUserById:
           Type: Api
           Properties:
             RestApiId: !Ref ServerlessRestApi
             Path:   /users/{userId}
             Method: GET
+            Auth: !If
+              - HasCustomerCognitoPool
+              - Authorizer: CustomerCognitoAuthorizer
+              - !Ref AWS::NoValue
         PostUsers:
           Type: Api
           Properties:
@@ -537,6 +549,10 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /users/{userId}
             Method: PUT
+            Auth: !If
+              - HasCustomerCognitoPool
+              - Authorizer: CustomerCognitoAuthorizer
+              - !Ref AWS::NoValue
         DeleteUser:
           Type: Api
           Properties:
