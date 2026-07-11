@@ -27,6 +27,14 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ALLOWED_ROLES   = {"customer", "admin", "staff"}
 ALLOWED_STATUSES = {"active", "inactive", "suspended"}
 
+# Mirrors the Cognito User Pool's password policy (chonkychonk-admin). Kept
+# in sync manually — if the pool policy changes, update this too so bad
+# passwords are rejected here instead of round-tripping to Cognito first.
+PASSWORD_MIN_LENGTH = 12
+PASSWORD_RE = re.compile(
+    r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\w\s]).{%d,}$" % PASSWORD_MIN_LENGTH
+)
+
 
 # ---------------------------------------------------------------------------
 # Inbound — what the frontend sends
@@ -35,6 +43,7 @@ ALLOWED_STATUSES = {"active", "inactive", "suspended"}
 @dataclass
 class CreateUserRequest:
     email:      str
+    password:   str
     first_name: Optional[str] = None
     last_name:  Optional[str] = None
     phone:      Optional[str] = None
@@ -84,18 +93,29 @@ def _validate_status(status: str) -> str:
     return status
 
 
+def _validate_password(password: str) -> str:
+    if not PASSWORD_RE.match(password):
+        raise ValidationError(
+            f"'password' must be at least {PASSWORD_MIN_LENGTH} characters and "
+            "include an uppercase letter, a lowercase letter, a number, and a symbol"
+        )
+    return password
+
+
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
 
 def parse_create_user_request(data: dict) -> CreateUserRequest:
-    email = _validate_email(str(_require(data, "email")))
+    email    = _validate_email(str(_require(data, "email")))
+    password = _validate_password(str(_require(data, "password")))
 
     role   = _validate_role(str(data.get("role", "customer")))
     status = _validate_status(str(data.get("status", "active")))
 
     return CreateUserRequest(
         email      = email,
+        password   = password,
         first_name = data.get("first_name"),
         last_name  = data.get("last_name"),
         phone      = data.get("phone"),

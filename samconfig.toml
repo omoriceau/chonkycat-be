@@ -27,6 +27,7 @@ parameter_overrides = [
   "PaymentsTableName=chonky-payments-dev",
   "PromotionsTableName=chonky-promotions-dev",
   "EventBusName=chonkychonk-bus",
+  "CognitoUserPoolId=us-east-1_tzozLyJBF",
   "StripeSecretKeySecretName=chonky/dev/stripe_secret_key",
   "StripeWebhookSecretName=chonky/dev/stripe_webhook_secret",
   "DevEmail=dev@example.com",
