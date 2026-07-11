@@ -47,6 +47,21 @@ Parameters:
     Type:    String
     Default: ""
 
+  # ----------------------------------------------------------
+  # Storefront-facing pool (chonky-cat-fe's Amplify Authenticator) —
+  # separate from CognitoUserPoolId above, which the Users Lambda uses for
+  # AdminCreateUser (staff/admin). The Orders Lambda uses this one to
+  # verify Authorization bearer tokens on cart requests (identity.py) and
+  # to authorize POST /cart/claim at the API Gateway level.
+  # ----------------------------------------------------------
+  CustomerCognitoUserPoolId:
+    Type:    String
+    Default: ""
+
+  CustomerCognitoAppClientId:
+    Type:    String
+    Default: ""
+
   ApigwWsEndpoint:
     Type:        String
     Default:     ""
@@ -114,6 +129,10 @@ Parameters:
 # ============================================================
 Conditions:
   HasStripeSecret: !Not [!Equals [!Ref StripeSecretKeyArn, ""]]
+  # Lets the stack deploy before the storefront's Amplify pool exists yet
+  # (CustomerCognitoUserPoolId defaults to "") — POST /cart/claim just runs
+  # without the Cognito authorizer attached until it's set.
+  HasCustomerCognitoPool: !Not [!Equals [!Ref CustomerCognitoUserPoolId, ""]]
 
 # ============================================================
 # Resources
@@ -129,6 +148,15 @@ Resources:
     Properties:
       StageName: !Ref Environment
       OpenApiVersion: '3.0.1'
+      # Only used by POST /cart/claim (see OrdersFunction below) — every
+      # other route stays unauthenticated at the API Gateway level, since
+      # the cart routes have to accept both guest and logged-in callers.
+      Auth: !If
+        - HasCustomerCognitoPool
+        - Authorizers:
+            CustomerCognitoAuthorizer:
+              UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CustomerCognitoUserPoolId}"
+        - !Ref AWS::NoValue
 
   # ----------------------------------------------------------
   # Shared Layer  —  contains shared/db.py and any other
@@ -305,9 +333,11 @@ Resources:
       Description:  Shopping cart CRUD - POST/GET/PUT/DELETE /orders
       Environment:
         Variables:
-          ORDERS_TABLE_NAME:     !Ref OrdersTableName
-          PRODUCTS_TABLE_NAME:   !Ref ProductsTableName
-          PROMOTIONS_TABLE_NAME: !Ref PromotionsTableName
+          ORDERS_TABLE_NAME:               !Ref OrdersTableName
+          PRODUCTS_TABLE_NAME:             !Ref ProductsTableName
+          PROMOTIONS_TABLE_NAME:           !Ref PromotionsTableName
+          CUSTOMER_COGNITO_USER_POOL_ID:   !Ref CustomerCognitoUserPoolId
+          CUSTOMER_COGNITO_APP_CLIENT_ID:  !Ref CustomerCognitoAppClientId
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref OrdersTableName
@@ -364,6 +394,80 @@ Resources:
           Properties:
             RestApiId: !Ref ServerlessRestApi
             Path:   /orders/{orderId}
+            Method: OPTIONS
+
+        # ---- Cart (guest or logged-in — see lambda_handler.py/identity.py) ----
+        GetCart:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart
+            Method: GET
+        CartPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart
+            Method: OPTIONS
+        AddCartItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/items
+            Method: POST
+        CartItemsPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/items
+            Method: OPTIONS
+        UpdateCartItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/items/{productId}
+            Method: PUT
+        RemoveCartItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/items/{productId}
+            Method: DELETE
+        CartItemByIdPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/items/{productId}
+            Method: OPTIONS
+        CheckoutCart:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/{orderId}/checkout
+            Method: POST
+        CheckoutCartPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/{orderId}/checkout
+            Method: OPTIONS
+        # The only cart route behind the Cognito authorizer — see the
+        # ServerlessRestApi/HasCustomerCognitoPool comments above.
+        ClaimCart:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/claim
+            Method: POST
+            Auth: !If
+              - HasCustomerCognitoPool
+              - Authorizer: CustomerCognitoAuthorizer
+              - !Ref AWS::NoValue
+        ClaimCartPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /cart/claim
             Method: OPTIONS
 
   # ----------------------------------------------------------
@@ -571,8 +675,12 @@ Outputs:
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/users"
 
   OrdersApi:
-    Description: Orders (shopping cart) endpoint
+    Description: Orders (one-shot placement) endpoint
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/orders"
+
+  CartApi:
+    Description: Cart endpoint (guest or logged-in)
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/cart"
 
   PaymentsApi:
     Description: Payments endpoint

@@ -97,6 +97,18 @@ def _require(d: dict, key: str) -> any:
     return val
 
 
+def _parse_shipping(raw_shipping: dict) -> ShippingAddress:
+    return ShippingAddress(
+        name        = str(_require(raw_shipping, "name")),
+        address1    = str(_require(raw_shipping, "address1")),
+        city        = str(_require(raw_shipping, "city")),
+        province    = str(_require(raw_shipping, "province")),
+        postal_code = str(_require(raw_shipping, "postal_code")),
+        country     = str(_require(raw_shipping, "country")),
+        address2    = raw_shipping.get("address2"),
+    )
+
+
 def parse_create_order_request(data: dict) -> CreateOrderRequest:
     # Items
     raw_items = _require(data, "items")
@@ -114,17 +126,7 @@ def parse_create_order_request(data: dict) -> CreateOrderRequest:
             raise ValidationError(f"items[{i}]: quantity must be >= 1")
         items.append(OrderItemRequest(product_id=product_id, quantity=quantity))
 
-    # Shipping
-    raw_shipping = _require(data, "shipping")
-    shipping = ShippingAddress(
-        name        = str(_require(raw_shipping, "name")),
-        address1    = str(_require(raw_shipping, "address1")),
-        city        = str(_require(raw_shipping, "city")),
-        province    = str(_require(raw_shipping, "province")),
-        postal_code = str(_require(raw_shipping, "postal_code")),
-        country     = str(_require(raw_shipping, "country")),
-        address2    = raw_shipping.get("address2"),
-    )
+    shipping = _parse_shipping(_require(data, "shipping"))
 
     return CreateOrderRequest(
         user_id          = str(_require(data, "user_id")),
@@ -167,17 +169,7 @@ def parse_update_order_request(data: dict) -> dict:
     
     # Shipping (optional)
     if "shipping" in data:
-        raw_shipping = data["shipping"]
-        shipping = ShippingAddress(
-            name        = str(_require(raw_shipping, "name")),
-            address1    = str(_require(raw_shipping, "address1")),
-            city        = str(_require(raw_shipping, "city")),
-            province    = str(_require(raw_shipping, "province")),
-            postal_code = str(_require(raw_shipping, "postal_code")),
-            country     = str(_require(raw_shipping, "country")),
-            address2    = raw_shipping.get("address2"),
-        )
-        update["shipping"] = shipping
+        update["shipping"] = _parse_shipping(data["shipping"])
     
     # Customer notes (optional)
     if "customer_notes" in data:
@@ -189,5 +181,73 @@ def parse_update_order_request(data: dict) -> dict:
     
     if not update:
         raise ValidationError("At least one field must be provided for update (items, shipping, customer_notes, or promotion_code)")
-    
+
     return update
+
+
+# ---------------------------------------------------------------------------
+# Inbound — cart endpoints (guest or logged-in; see identity.py)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AddCartItemRequest:
+    product_id: str
+    quantity:   int
+
+
+@dataclass
+class UpdateCartItemRequest:
+    quantity: int
+
+
+@dataclass
+class ClaimCartRequest:
+    guest_id: str
+
+
+@dataclass
+class CheckoutCartRequest:
+    shipping:         ShippingAddress
+    customer_email:   str
+    currency:         str           = "CAD"
+    promotion_code:   Optional[str] = None
+    customer_notes:   Optional[str] = None
+    connection_id:    Optional[str] = None
+    payment_provider: str           = "stripe"
+
+
+def parse_add_cart_item_request(data: dict) -> AddCartItemRequest:
+    product_id = str(_require(data, "product_id"))
+    try:
+        quantity = int(_require(data, "quantity"))
+    except (TypeError, ValueError):
+        raise ValidationError("'quantity' must be an integer")
+    if quantity < 1:
+        raise ValidationError("'quantity' must be >= 1")
+    return AddCartItemRequest(product_id=product_id, quantity=quantity)
+
+
+def parse_update_cart_item_request(data: dict) -> UpdateCartItemRequest:
+    try:
+        quantity = int(_require(data, "quantity"))
+    except (TypeError, ValueError):
+        raise ValidationError("'quantity' must be an integer")
+    if quantity < 0:
+        raise ValidationError("'quantity' must be >= 0")
+    return UpdateCartItemRequest(quantity=quantity)
+
+
+def parse_claim_cart_request(data: dict) -> ClaimCartRequest:
+    return ClaimCartRequest(guest_id=str(_require(data, "guest_id")))
+
+
+def parse_checkout_cart_request(data: dict) -> CheckoutCartRequest:
+    return CheckoutCartRequest(
+        shipping         = _parse_shipping(_require(data, "shipping")),
+        customer_email   = str(_require(data, "customer_email")),
+        currency         = str(data.get("currency", "CAD")).upper(),
+        promotion_code   = data.get("promotion_code"),
+        customer_notes   = data.get("customer_notes"),
+        connection_id    = data.get("connection_id"),
+        payment_provider = str(data.get("payment_provider", "stripe")),
+    )
