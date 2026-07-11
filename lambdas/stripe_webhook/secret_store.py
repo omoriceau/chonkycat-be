@@ -1,5 +1,5 @@
 """
-secrets.py — generic AWS Secrets Manager lookup, cached per warm container.
+secret_store.py — generic AWS Secrets Manager lookup, cached per warm container.
 
 Fetches an actual secret *value* given a secret *name*. The Lambda's
 execution role must be granted secretsmanager:GetSecretValue for that
@@ -8,6 +8,11 @@ specific secret ARN (see template.yaml's Policies block for this function).
 Handles both plain-string secrets and JSON secrets with a single key
 (e.g. {"stripe_webhook_secret": "whsec_..."}) — Secrets Manager supports
 both, and which one exists depends on how the secret was created.
+
+NOTE: deliberately not named secrets.py — that shadows the Python stdlib
+`secrets` module (since the Lambda runtime puts this directory ahead of
+the stdlib on sys.path), which botocore's own dependency chain imports
+internally and will crash on with a circular-import error if shadowed.
 """
 
 import json
