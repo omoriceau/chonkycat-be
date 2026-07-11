@@ -51,6 +51,7 @@ import os
 from models import ValidationError, parse_create_order_request, parse_update_order_request
 from service import OrderService
 from botocore.exceptions import ClientError
+from shared.cors import build_cors_headers, is_preflight, preflight_response
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -70,10 +71,23 @@ def _get_service() -> OrderService:
 # Response helpers
 # ---------------------------------------------------------------------------
 
+# Set once at the top of lambda_handler() so ok()/err() can shape CORS
+# headers for the current request without threading `event` through every
+# handler function.
+_current_event: dict = {}
+
+
+def _cors_headers() -> dict:
+    return {
+        "Content-Type": "application/json",
+        **build_cors_headers(_current_event),
+    }
+
+
 def ok(body: dict, status: int = 200) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": _cors_headers(),
         "body": json.dumps(body, default=str),
     }
 
@@ -81,7 +95,7 @@ def ok(body: dict, status: int = 200) -> dict:
 def err(message: str, status: int = 400) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": _cors_headers(),
         "body": json.dumps({"error": message}),
     }
 
@@ -92,6 +106,12 @@ def err(message: str, status: int = 400) -> dict:
 
 def lambda_handler(event: dict, context) -> dict:
     logger.info("Order request received")
+
+    global _current_event
+    _current_event = event or {}
+
+    if is_preflight(event):
+        return preflight_response(event)
 
     method = event.get("httpMethod", "")
 

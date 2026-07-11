@@ -46,7 +46,7 @@ EOF
 ENVIRONMENT="dev"
 REGION_ARG=""
 DEV_EMAIL="dev@example.com"
-ALLOW_CORS=false
+ALLOW_CORS=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -223,7 +223,7 @@ fi
 # ==============================================================================
 
 log "Building lambda package..."
-sam build
+sam build --config-env dev
 
 # ==============================================================================
 # Deploy
@@ -262,12 +262,15 @@ fi
 # still lists any of them as Parameters, `sam deploy` will fail demanding a
 # value; go drop them from the template rather than adding them back here.
 PARAM_OVERRIDES=(
+  "ParameterKey=Environment,ParameterValue=$ENVIRONMENT"
   "ParameterKey=UsersTableName,ParameterValue=$USERS_TABLE_NAME"
   "ParameterKey=ProductsTableName,ParameterValue=$PRODUCTS_TABLE_NAME"
   "ParameterKey=OrdersTableName,ParameterValue=$ORDERS_TABLE_NAME"
   "ParameterKey=PaymentsTableName,ParameterValue=$PAYMENTS_TABLE_NAME"
   "ParameterKey=PromotionsTableName,ParameterValue=$PROMOTIONS_TABLE_NAME"
+  "ParameterKey=EventBusName,ParameterValue=$EVENT_BUS_NAME"
   "ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key"
+  "ParameterKey=StripeWebhookSecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_webhook_secret"
   "ParameterKey=DevEmail,ParameterValue=$DEV_EMAIL"
 )
 
@@ -287,6 +290,92 @@ sam deploy \
     --capabilities CAPABILITY_IAM \
     --no-confirm-changeset \
     --parameter-overrides "${PARAM_OVERRIDES[@]}"
+
+# ==============================================================================
+# Custom domain: map this stack's API to api.chonkycat.ca
+#
+# The domain itself (and its ACM cert) is provisioned out-of-band in API
+# Gateway already — this only creates/updates the base path mapping so
+# api.chonkycat.ca routes to this stack's REST API + live stage.
+#
+# The live stage name is looked up from API Gateway directly rather than
+# assumed to equal $ENVIRONMENT: when ServerlessRestApi.StageName is set to
+# !Ref Environment, SAM's transform can't resolve that intrinsic at macro
+# time and silently falls back to hardcoding the stage name "Prod"
+# regardless of the parameter's actual value (confirmed against this
+# account's deployed stack). Filtering get-stages by the
+# aws:cloudformation:stack-name tag finds whichever stage this stack
+# actually owns, bug or no bug.
+#
+# Base path "" maps the domain root straight to this one stage. That only
+# works cleanly for a single live environment sharing the domain — if
+# staging/prod ever run side by side, each additional one needs its own
+# base path (e.g. /staging) since only one stack can hold the root mapping.
+# ==============================================================================
+attach_custom_domain() {
+  local domain_name="api.chonkycat.ca"
+
+  log "Attaching custom domain: $domain_name"
+
+  if ! aws apigateway get-domain-names \
+      --region "$REGION" \
+      --query "items[?domainName=='$domain_name']" \
+      --output text 2>/dev/null | grep -q .; then
+    warn "Custom domain '$domain_name' not found in API Gateway — skipping mapping. Provision it (with its ACM cert) first."
+    return
+  fi
+
+  local api_id
+  api_id=$(aws cloudformation describe-stack-resources \
+      --stack-name "$STACK_NAME" \
+      --logical-resource-id ServerlessRestApi \
+      --region "$REGION" \
+      --query 'StackResources[0].PhysicalResourceId' \
+      --output text 2>/dev/null || echo "")
+
+  if [ -z "$api_id" ] || [ "$api_id" = "None" ]; then
+    warn "Could not find ServerlessRestApi in stack $STACK_NAME — skipping custom domain mapping."
+    return
+  fi
+
+  local stage_name
+  stage_name=$(aws apigateway get-stages \
+      --rest-api-id "$api_id" \
+      --region "$REGION" \
+      --query "item[?tags.\"aws:cloudformation:stack-name\"=='${STACK_NAME}'].stageName | [0]" \
+      --output text 2>/dev/null || echo "")
+
+  if [ -z "$stage_name" ] || [ "$stage_name" = "None" ]; then
+    warn "Could not determine the live API Gateway stage for $STACK_NAME — skipping custom domain mapping."
+    return
+  fi
+
+  log "Mapping $domain_name -> API $api_id, stage $stage_name"
+
+  if aws apigateway get-base-path-mapping \
+      --domain-name "$domain_name" \
+      --base-path "(none)" \
+      --region "$REGION" >/dev/null 2>&1; then
+    log "Base path mapping already exists — updating it to point at $api_id/$stage_name"
+    aws apigateway update-base-path-mapping \
+        --domain-name "$domain_name" \
+        --base-path "(none)" \
+        --patch-operations op=replace,path=/restapiId,value="$api_id" op=replace,path=/stage,value="$stage_name" \
+        --region "$REGION" >/dev/null
+  else
+    log "Creating base path mapping"
+    aws apigateway create-base-path-mapping \
+        --domain-name "$domain_name" \
+        --rest-api-id "$api_id" \
+        --stage "$stage_name" \
+        --base-path "" \
+        --region "$REGION" >/dev/null
+  fi
+
+  log "Custom domain mapping configured: https://$domain_name -> $api_id ($stage_name)"
+}
+
+attach_custom_domain
 
 # ==============================================================================
 # EventBridge: wire UserCreated events (from the users Lambda) to the

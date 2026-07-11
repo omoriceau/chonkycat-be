@@ -128,6 +128,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Environment
+      OpenApiVersion: '3.0.1'
 
   # ----------------------------------------------------------
   # Shared Layer  —  contains shared/db.py and any other
@@ -162,8 +163,16 @@ Resources:
   # ----------------------------------------------------------
 
   # ----------------------------------------------------------
-  # Products Lambda  —  GET /products and GET /products/{productid}
-  # DynamoDB, no VPC.
+  # Products Lambda  —  full CRUD: GET/POST/PUT/PATCH/DELETE
+  # /products and /products/{productid}. DynamoDB, no VPC.
+  #
+  # Auth is not configured in this template (see the
+  # ServerlessRestApi comment above) — it's attached externally
+  # via scripts/attach-cognito-authorizer.sh, which needs an
+  # entry for each of CreateProduct/UpdateProduct/PatchProduct/
+  # DeleteProduct below, while leaving GetProducts and
+  # GetProductById public so the storefront can browse/view
+  # products without signing in.
   # ----------------------------------------------------------
   ProductsFunction:
     Type: AWS::Serverless::Function
@@ -171,12 +180,12 @@ Resources:
       FunctionName: !Sub chonkychonk-products-${Environment}
       CodeUri:      lambdas/products/
       Handler:      lambda_handler.lambda_handler
-      Description:  GET /products and GET /products/{productid}
+      Description:  Product catalog CRUD - GET (public) / POST/PUT/PATCH/DELETE (authenticated) /products
       Environment:
         Variables:
           PRODUCTS_TABLE_NAME: !Ref ProductsTableName
       Policies:
-        - DynamoDBReadPolicy:
+        - DynamoDBCrudPolicy:
             TableName: !Ref ProductsTableName
       Events:
         GetProducts:
@@ -191,6 +200,42 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /products/{productid}
             Method: GET
+        CreateProduct:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products
+            Method: POST
+        UpdateProduct:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products/{productid}
+            Method: PUT
+        PatchProduct:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products/{productid}
+            Method: PATCH
+        DeleteProduct:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products/{productid}
+            Method: DELETE
+        ProductsPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products
+            Method: OPTIONS
+        ProductByIdPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /products/{productid}
+            Method: OPTIONS
 
   # ----------------------------------------------------------
   # Stripe Intent Lambda  —  NO VPC, calls Stripe API
@@ -308,6 +353,18 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /orders/{orderId}
             Method: DELETE
+        OrdersPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /orders
+            Method: OPTIONS
+        OrderByIdPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /orders/{orderId}
+            Method: OPTIONS
 
   # ----------------------------------------------------------
   # Users Lambda  —  POST/GET/PUT/DELETE /users (user management)
@@ -323,6 +380,7 @@ Resources:
       Environment:
         Variables:
           USERS_TABLE_NAME: !Ref UsersTableName
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTableName
@@ -338,6 +396,18 @@ Resources:
                 - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
+        # Create/delete/set-password/update-email on the Cognito side of a
+        # user's account — the users table itself never stores a password.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminDeleteUser
+                - cognito-idp:AdminUpdateUserAttributes
+              Resource:
+                - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
       Events:
         GetUsers:
           Type: Api
@@ -369,6 +439,18 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /users/{userId}
             Method: DELETE
+        UsersPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users
+            Method: OPTIONS
+        UserByIdPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /users/{userId}
+            Method: OPTIONS
 
   # ----------------------------------------------------------
   # Payments Lambda  —  charge / refund via EventBridge
@@ -414,6 +496,12 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /payments
             Method: POST
+        PaymentsPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessRestApi
+            Path:   /payments
+            Method: OPTIONS
 
   # ----------------------------------------------------------
   # Stripe Webhook Lambda  —  listens for Stripe events
@@ -422,6 +510,10 @@ Resources:
   # been decommissioned, so there is nothing left to connect to. This
   # function's code needs to move to DynamoDB before it will work again;
   # the table env vars/policies below are already in place for that.
+  #
+  # Must stay excluded from attach-cognito-authorizer.sh — Stripe
+  # calls this directly and signs the request with its own webhook
+  # secret (verified in the handler), not a Cognito token.
   # ----------------------------------------------------------
   StripeWebhookFunction:
     Type: AWS::Serverless::Function
@@ -464,7 +556,7 @@ Resources:
             RestApiId: !Ref ServerlessRestApi
             Path:   /webhook
             Method: POST
-  
+
 # ============================================================
 # Outputs — printed after every deploy, useful for wiring
 # up WebSocket endpoint, Cognito, and frontend config

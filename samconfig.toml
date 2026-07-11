@@ -20,6 +20,7 @@ capabilities      = "CAPABILITY_IAM"
 s3_bucket         = "chonkychonk-sam-artifacts-dev"
 resolve_s3        = false
 parameter_overrides = [
+  "Environment=dev",
   "UsersTableName=chonky-users-dev",
   "ProductsTableName=chonky-products-dev",
   "OrdersTableName=chonky-orders-dev",

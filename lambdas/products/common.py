@@ -13,6 +13,8 @@ import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from shared.cors import build_cors_headers
+
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -31,12 +33,21 @@ DEFAULT_ACTIVE = True
 # HTTP plumbing
 # ---------------------------------------------------------------------------
 
+# Set once at the top of lambda_handler() so ok()/err()/no_content() (called
+# from deep inside handlers/ without the event in scope) can still shape
+# CORS headers for the current request.
+_current_event: dict = {}
+
+
+def set_request_context(event: dict) -> None:
+    global _current_event
+    _current_event = event or {}
+
+
 def cors_headers() -> dict:
     return {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        **build_cors_headers(_current_event, methods="GET, POST, PUT, PATCH, DELETE, OPTIONS"),
     }
 
 

@@ -15,16 +15,21 @@ This file only routes; each operation's logic lives in handlers/.
 import json
 import traceback
 
-from common import err, get_http_method
+from common import err, get_http_method, set_request_context
 from db import get_db_client
 from handlers.create import handle_create_product
 from handlers.delete import handle_delete_product
 from handlers.read import handle_get_product, handle_list_products
 from handlers.update import handle_update_product
+from shared.cors import is_preflight, preflight_response
 
 
 def lambda_handler(event: dict, context) -> dict:
     print(f"[DEBUG] event: {json.dumps(event, default=str)}")
+
+    set_request_context(event)
+    if is_preflight(event):
+        return preflight_response(event, methods="GET, POST, PUT, PATCH, DELETE, OPTIONS")
 
     try:
         db = get_db_client()
