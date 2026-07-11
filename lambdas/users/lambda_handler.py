@@ -11,9 +11,10 @@ Routes:
   DELETE /users/{userId}   Delete a user
 
 Environment Variables:
-  - USERS_TABLE_NAME   DynamoDB table name (aws_dynamodb_table.users.name)
-  - EVENT_BUS_NAME     EventBridge bus for the UserCreated event (optional,
-                        defaults to "chonkychonk-bus")
+  - USERS_TABLE_NAME     DynamoDB table name (aws_dynamodb_table.users.name)
+  - COGNITO_USER_POOL_ID Cognito User Pool backing auth (chonkychonk-admin)
+  - EVENT_BUS_NAME       EventBridge bus for the UserCreated event (optional,
+                          defaults to "chonkychonk-bus")
 
 NOTE: user IDs used to be sequential integers (Postgres SERIAL). They are
 now randomly generated UUID strings, since DynamoDB has no auto-increment
@@ -23,12 +24,19 @@ treat it as an opaque string.
 Example create request body:
 {
     "email": "benny.garcia@email.com",
+    "password": "Correct-Horse-Battery-9",
     "first_name": "Benny",
     "last_name": "Garcia",
     "phone": "+1-416-555-0142",
     "role": "customer",
     "status": "active"
 }
+
+Auth: user creation is backed by Cognito (chonkychonk-admin user pool). The
+Lambda calls AdminCreateUser + AdminSetUserPassword itself, so the caller
+just supplies a password once — no confirmation code / temp-password reset
+flow. The DynamoDB user_id is the Cognito `sub`, so the two records are
+always linked 1:1.
 """
 
 import json
