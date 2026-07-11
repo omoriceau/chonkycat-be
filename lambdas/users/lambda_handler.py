@@ -131,12 +131,39 @@ def _parse_user_id(event: dict) -> str:
     return user_id
 
 
+def _authenticated_sub(event: dict) -> str | None:
+    """
+    The sub API Gateway's Cognito authorizer already verified for this
+    request (see GetUserById/PutUser's Auth block in template.yaml), or
+    None if no authorizer ran — e.g. CustomerCognitoUserPoolId isn't
+    configured yet in this environment.
+    """
+    claims = ((event or {}).get("requestContext") or {}).get("authorizer", {}).get("claims", {})
+    return claims.get("sub")
+
+
+def _require_self(event: dict, user_id: str) -> dict | None:
+    """
+    GetUserById/PutUser are the self-service profile routes — a shopper
+    may only read/edit their own row. Returns an error response to return
+    immediately, or None if the check passed.
+    """
+    caller_sub = _authenticated_sub(event)
+    if caller_sub is None or caller_sub != user_id:
+        return err("You can only view or update your own profile", status=403)
+    return None
+
+
 def _handle_get_user(event: dict) -> dict:
     """GET /users/{userId}"""
     try:
         user_id = _parse_user_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
+
+    forbidden = _require_self(event, user_id)
+    if forbidden:
+        return forbidden
 
     try:
         result = _get_service().get_user(user_id)
@@ -196,6 +223,15 @@ def _handle_create_user(event: dict) -> dict:
     return ok({"message": "User created.", "user": result}, status=201)
 
 
+# Fields a signed-in shopper editing their own profile isn't allowed to
+# touch — email is a separate change-of-identity flow (would need to move
+# the Cognito username/alias too), and role/status are admin-only, so a
+# self-service PUT quietly overwriting them would be a privilege
+# escalation bug now that this route is reachable by any authenticated
+# customer, not just trusted admin tooling.
+_SELF_SERVICE_FORBIDDEN_FIELDS = ("email", "role", "status")
+
+
 def _handle_update_user(event: dict) -> dict:
     """PUT /users/{userId}"""
     try:
@@ -203,11 +239,19 @@ def _handle_update_user(event: dict) -> dict:
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
 
+    forbidden = _require_self(event, user_id)
+    if forbidden:
+        return forbidden
+
     body = event.get("body", "{}")
     try:
         data = json.loads(body) if isinstance(body, str) else body
     except json.JSONDecodeError:
         return err("Request body is not valid JSON", status=400)
+
+    disallowed = [f for f in _SELF_SERVICE_FORBIDDEN_FIELDS if f in data]
+    if disallowed:
+        return err(f"Cannot self-update field(s): {', '.join(disallowed)}", status=403)
 
     try:
         update = parse_update_user_request(data)
