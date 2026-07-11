@@ -33,7 +33,9 @@ from shared.events import (
 )
 
 from models import (
+    CheckoutCartRequest,
     CreateOrderRequest,
+    OrderItemRequest,
     ResolvedOrder,
     ResolvedOrderItem,
     ShippingAddress,
@@ -287,6 +289,265 @@ class OrderService:
             "total":        str(total_amount),
             "currency":     request.currency,
             "status":       "pending",
+        }
+
+    # ------------------------------------------------------------------
+    # Cart  (status="cart" ORDER rows — see identity.py for how user_id,
+    # guest or logged-in, is resolved before these are called)
+    # ------------------------------------------------------------------
+
+    def get_cart(self, user_id: str) -> dict:
+        cart = self._db.get_open_cart(user_id)
+        if cart is None:
+            return self._empty_cart_response()
+        items = self._db.get_order_with_children(cart["order_id"])["items"]
+        return self._cart_to_response(cart, items)
+
+    def add_cart_item(self, user_id: str, product_id: str, quantity: int) -> dict:
+        product = self._get_active_product(product_id)
+
+        cart = self._db.get_open_cart(user_id)
+        if cart is None:
+            cart = self._create_cart(user_id)
+
+        existing = self._db.get_cart_item(cart["order_id"], product_id)
+        new_quantity = (int(existing["quantity"]) if existing else 0) + quantity
+        self._put_cart_item(cart["order_id"], product, new_quantity)
+        self._db.touch_cart_order(cart["order_id"])
+
+        return self.get_cart(user_id)
+
+    def update_cart_item(self, user_id: str, product_id: str, quantity: int) -> dict:
+        cart = self._db.get_open_cart(user_id)
+        if cart is None:
+            raise ValidationError("Cart is empty")
+
+        if quantity == 0:
+            self._db.delete_cart_item(cart["order_id"], product_id)
+        else:
+            product = self._get_active_product(product_id)
+            self._put_cart_item(cart["order_id"], product, quantity)
+        self._db.touch_cart_order(cart["order_id"])
+
+        return self.get_cart(user_id)
+
+    def remove_cart_item(self, user_id: str, product_id: str) -> dict:
+        cart = self._db.get_open_cart(user_id)
+        if cart is None:
+            raise ValidationError("Cart is empty")
+
+        self._db.delete_cart_item(cart["order_id"], product_id)
+        self._db.touch_cart_order(cart["order_id"])
+
+        return self.get_cart(user_id)
+
+    def checkout_cart(self, user_id: str, order_id: str, request: CheckoutCartRequest) -> dict:
+        """
+        Transitions a status="cart" order into a real, paid-for-eligible
+        "pending" order in place (same order_id throughout) — validates
+        stock, resolves the promotion, computes totals, decrements stock,
+        and fires OrderCreated, reusing the same logic create_order() uses
+        for a one-shot order.
+        """
+        current_state = self._db.get_order_with_children(order_id)
+        if current_state is None or current_state["order"].get("user_id") != user_id:
+            raise ValidationError("Cart not found")
+
+        current = current_state["order"]
+        if current["status"] != "cart":
+            raise ValidationError(f"Order is not an open cart (status='{current['status']}')")
+
+        item_rows = current_state["items"]
+        if not item_rows:
+            raise ValidationError("Cart is empty")
+
+        cart_items = [
+            OrderItemRequest(product_id=row["product_id"], quantity=int(row["quantity"]))
+            for row in item_rows
+        ]
+        resolved_items = self._resolve_items(cart_items)
+        promotion_code_resolved, discount = self._resolve_promotion(request.promotion_code, resolved_items)
+
+        subtotal        = _cents(sum(i.line_total for i in resolved_items))
+        discounted_sub  = _cents(max(Decimal("0"), subtotal - discount))
+        shipping_amount = Decimal("0") if discounted_sub >= FREE_SHIP_ABOVE else FLAT_SHIP_FEE
+        tax_amount      = _cents(discounted_sub * TAX_RATE)
+        total_amount    = _cents(discounted_sub + tax_amount + shipping_amount)
+
+        resolved = ResolvedOrder(
+            user_id          = user_id,
+            customer_email   = request.customer_email,
+            items            = resolved_items,
+            shipping         = request.shipping,
+            subtotal         = subtotal,
+            tax_amount       = tax_amount,
+            shipping_amount  = shipping_amount,
+            discount_amount  = discount,
+            total_amount     = total_amount,
+            promotion_id     = promotion_code_resolved,
+            promotion_code   = request.promotion_code,
+            customer_notes   = request.customer_notes,
+            currency         = request.currency,
+            connection_id    = request.connection_id,
+            payment_provider = request.payment_provider,
+        )
+
+        order_updates = {
+            "status": "pending",
+            "subtotal": str(resolved.subtotal),
+            "tax_amount": str(resolved.tax_amount),
+            "shipping_amount": str(resolved.shipping_amount),
+            "total_amount": str(resolved.total_amount),
+            "customer_email": resolved.customer_email,
+            "customer_notes": resolved.customer_notes,
+            "shipping_name": resolved.shipping.name,
+            "shipping_address1": resolved.shipping.address1,
+            "shipping_address2": resolved.shipping.address2,
+            "shipping_city": resolved.shipping.city,
+            "shipping_province": resolved.shipping.province,
+            "shipping_postal_code": resolved.shipping.postal_code,
+            "shipping_country": resolved.shipping.country,
+            "connection_id": resolved.connection_id,
+            "updated_at": _now_iso(),
+        }
+        # Drop unset optional fields — same reasoning as _insert_order()'s
+        # equivalent filter: DynamoDB would otherwise store them as
+        # explicit NULL-type attributes instead of just omitting them.
+        order_updates = {k: v for k, v in order_updates.items() if v is not None}
+        if promotion_code_resolved:
+            order_updates["applied_promotions"] = [
+                {"code": promotion_code_resolved, "discount_amount": str(discount)}
+            ]
+
+        # Stock sufficiency was already checked by _resolve_items() above;
+        # decrement_stock() below is a best-effort, non-transactional
+        # follow-up (same as the one-shot create_order() path) — a rare
+        # race there logs and self-corrects via the periodic sync job
+        # rather than failing an order that's already been persisted.
+        try:
+            self._db.finalize_cart_order(order_id, order_updates)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise ValidationError("This cart has already been checked out")
+            raise
+
+        stock_decrements = [
+            {"product_id": str(item.product_id), "quantity": item.quantity}
+            for item in resolved.items
+        ]
+        self._db.decrement_stock(stock_decrements)
+
+        self._emit_order_created(order_id, resolved)
+        self._emit_low_stock_if_needed(resolved.items)
+
+        return {
+            "order_id":     order_id,
+            "subtotal":     str(subtotal),
+            "discount":     str(discount),
+            "tax":          str(tax_amount),
+            "shipping":     str(shipping_amount),
+            "total":        str(total_amount),
+            "currency":     request.currency,
+            "status":       "pending",
+        }
+
+    def claim_guest_cart(self, authenticated_user_id: str, guest_id: str) -> dict:
+        """
+        Transfers a guest's cart onto the now-authenticated user, called
+        right after login/signup. If the user already has their own open
+        cart, the guest's items are merged into it (quantities summed for
+        matching products) and the guest order is discarded; otherwise the
+        guest order is simply re-keyed onto the real user id.
+        """
+        guest_user_id = f"guest_{guest_id}"
+        guest_cart = self._db.get_open_cart(guest_user_id)
+        if guest_cart is None:
+            return self.get_cart(authenticated_user_id)
+
+        guest_items = self._db.get_order_with_children(guest_cart["order_id"])["items"]
+        own_cart = self._db.get_open_cart(authenticated_user_id)
+
+        if own_cart is None:
+            self._db.reassign_cart_owner(guest_cart["order_id"], authenticated_user_id)
+            return self.get_cart(authenticated_user_id)
+
+        for row in guest_items:
+            existing = self._db.get_cart_item(own_cart["order_id"], row["product_id"])
+            new_quantity = int(row["quantity"]) + (int(existing["quantity"]) if existing else 0)
+            product = {
+                "product_id": row["product_id"],
+                "name": row["name_snapshot"],
+                "price": row["unit_price"],
+            }
+            self._put_cart_item(own_cart["order_id"], product, new_quantity)
+
+        self._db.touch_cart_order(own_cart["order_id"])
+        guest_item_sks = [row["sk"] for row in guest_items]
+        self._db.delete_order_with_items(guest_cart["order_id"], guest_item_sks)
+
+        return self.get_cart(authenticated_user_id)
+
+    # ------------------------------------------------------------------
+    # Cart — helpers
+    # ------------------------------------------------------------------
+
+    def _get_active_product(self, product_id: str) -> dict:
+        product_map = self._db.batch_get_products([product_id])
+        product = product_map.get(product_id)
+        if not product:
+            raise ValidationError(f"Product {product_id} not found")
+        if not product.get("active"):
+            raise ValidationError(f"Product {product_id} is not available")
+        return product
+
+    def _create_cart(self, user_id: str) -> dict:
+        order_id = str(uuid.uuid4())
+        created_at = _now_iso()
+        order_item = {
+            "order_id": order_id,
+            "sk": "ORDER",
+            "user_id": user_id,
+            "status": "cart",
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        self._db.create_cart_order(order_item)
+        return order_item
+
+    def _put_cart_item(self, order_id: str, product: dict, quantity: int) -> None:
+        unit_price = Decimal(str(product["price"]))
+        self._db.put_cart_item({
+            "order_id": order_id,
+            "sk": f"ITEM#{product['product_id']}",
+            "product_id": str(product["product_id"]),
+            "quantity": quantity,
+            "unit_price": str(unit_price),
+            "line_total": str(_cents(unit_price * quantity)),
+            "name_snapshot": product["name"],
+        })
+
+    @staticmethod
+    def _empty_cart_response() -> dict:
+        return {"order_id": None, "status": "cart", "items": [], "subtotal": "0.00"}
+
+    @staticmethod
+    def _cart_to_response(order: dict, item_rows: list[dict]) -> dict:
+        items = [
+            {
+                "product_id": row["product_id"],
+                "quantity": int(row["quantity"]),
+                "unit_price": str(row["unit_price"]),
+                "line_total": str(row["line_total"]),
+                "name_snapshot": row["name_snapshot"],
+            }
+            for row in item_rows
+        ]
+        subtotal = _cents(sum((Decimal(str(i["line_total"])) for i in items), Decimal("0")))
+        return {
+            "order_id": order["order_id"],
+            "status": order["status"],
+            "items": items,
+            "subtotal": str(subtotal),
         }
 
     # ------------------------------------------------------------------

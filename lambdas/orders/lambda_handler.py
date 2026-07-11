@@ -1,7 +1,14 @@
 """
 orders/lambda_handler.py
 
-Entry point: POST /orders
+Entry points:
+  POST/GET/PUT/DELETE /orders          one-shot order placement (unchanged)
+  GET    /cart                         fetch the caller's open cart
+  POST   /cart/items                   add (or increment) a cart line item
+  PUT    /cart/items/{productId}       set a cart line item's quantity
+  DELETE /cart/items/{productId}       remove a cart line item
+  POST   /cart/{orderId}/checkout      turn a cart into a real pending order
+  POST   /cart/claim                   transfer a guest cart onto the caller
 
 Accepts a JSON body from the frontend, validates it, persists the order,
 and fires an OrderCreated EventBridge event that the Payment Lambda consumes.
@@ -9,11 +16,18 @@ and fires an OrderCreated EventBridge event that the Payment Lambda consumes.
 The frontend should include its WebSocket connection_id in the request body
 so the Payment Lambda can push the result back directly.
 
+The /cart* routes accept both guest and logged-in callers on the same
+route (see identity.py) — every one of them except /cart/claim resolves
+identity itself rather than relying on API Gateway's authorizer, which is
+all-or-nothing per route.
+
 Environment Variables:
-  - ORDERS_TABLE_NAME      DynamoDB orders table name
-  - PRODUCTS_TABLE_NAME    DynamoDB products table name (stock check/decrement)
-  - PROMOTIONS_TABLE_NAME  DynamoDB promotions table name
-  - EVENT_BUS_NAME         EventBridge bus name (default: chonkychonk-bus)
+  - ORDERS_TABLE_NAME              DynamoDB orders table name
+  - PRODUCTS_TABLE_NAME            DynamoDB products table name (stock check/decrement)
+  - PROMOTIONS_TABLE_NAME          DynamoDB promotions table name
+  - EVENT_BUS_NAME                 EventBridge bus name (default: chonkychonk-bus)
+  - CUSTOMER_COGNITO_USER_POOL_ID  Storefront Cognito pool (verifies cart Bearer tokens)
+  - CUSTOMER_COGNITO_APP_CLIENT_ID Storefront Cognito app client id (optional aud check)
 
 NOTE: order IDs used to be sequential integers (Postgres SERIAL). They are
 now randomly generated UUID strings, since DynamoDB has no auto-increment
@@ -48,7 +62,16 @@ import json
 import logging
 import os
 
-from models import ValidationError, parse_create_order_request, parse_update_order_request
+from identity import IdentityError, resolve_authenticated_user_id, resolve_user_id
+from models import (
+    ValidationError,
+    parse_add_cart_item_request,
+    parse_checkout_cart_request,
+    parse_claim_cart_request,
+    parse_create_order_request,
+    parse_update_cart_item_request,
+    parse_update_order_request,
+)
 from service import OrderService
 from botocore.exceptions import ClientError
 from shared.cors import build_cors_headers, is_preflight, preflight_response
@@ -114,6 +137,10 @@ def lambda_handler(event: dict, context) -> dict:
         return preflight_response(event)
 
     method = event.get("httpMethod", "")
+    resource = event.get("resource", "")
+
+    if resource.startswith("/cart"):
+        return _handle_cart_request(event, resource, method)
 
     # Route based on HTTP method
     if method == "GET":
@@ -244,4 +271,191 @@ def _handle_delete_order(event: dict) -> dict:
         })
     except Exception:
         logger.exception("Error deleting order")
+        return err("Internal server error", status=500)
+
+
+# ---------------------------------------------------------------------------
+# Cart handler
+#
+# GET/POST/PUT/DELETE on /cart* — guest or logged-in, resolved per-request
+# by identity.py rather than by an API Gateway authorizer (which is
+# all-or-nothing per route and these routes need to accept both). The one
+# exception is /cart/claim, which sits behind the Cognito authorizer (see
+# template.yaml) since it's the one place a caller must prove who they are.
+# ---------------------------------------------------------------------------
+
+def _handle_cart_request(event: dict, resource: str, method: str) -> dict:
+    try:
+        if resource == "/cart" and method == "GET":
+            return _handle_get_cart(event)
+        if resource == "/cart/items" and method == "POST":
+            return _handle_add_cart_item(event)
+        if resource == "/cart/items/{productId}" and method == "PUT":
+            return _handle_update_cart_item(event)
+        if resource == "/cart/items/{productId}" and method == "DELETE":
+            return _handle_remove_cart_item(event)
+        if resource == "/cart/{orderId}/checkout" and method == "POST":
+            return _handle_checkout_cart(event)
+        if resource == "/cart/claim" and method == "POST":
+            return _handle_claim_cart(event)
+        return err(f"Unsupported route: {method} {resource}", status=405)
+    except IdentityError as e:
+        return err(str(e), status=401)
+
+
+def _handle_get_cart(event: dict) -> dict:
+    """GET /cart"""
+    user_id = resolve_user_id(event)
+    try:
+        return ok({"cart": _get_service().get_cart(user_id)})
+    except Exception:
+        logger.exception("Error retrieving cart")
+        return err("Internal server error", status=500)
+
+
+def _handle_add_cart_item(event: dict) -> dict:
+    """POST /cart/items"""
+    user_id = resolve_user_id(event)
+
+    body = event.get("body", "{}")
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        return err("Request body is not valid JSON", status=400)
+
+    try:
+        request = parse_add_cart_item_request(data)
+    except ValidationError as e:
+        return err(str(e), status=422)
+
+    try:
+        cart = _get_service().add_cart_item(user_id, request.product_id, request.quantity)
+        return ok({"cart": cart}, status=201)
+    except ValidationError as e:
+        return err(str(e), status=422)
+    except Exception:
+        logger.exception("Error adding cart item")
+        return err("Internal server error", status=500)
+
+
+def _parse_cart_product_id(event: dict) -> str:
+    product_id = event["pathParameters"]["productId"]
+    if not isinstance(product_id, str) or not product_id.strip():
+        raise ValueError("empty productId")
+    return product_id
+
+
+def _handle_update_cart_item(event: dict) -> dict:
+    """PUT /cart/items/{productId}"""
+    user_id = resolve_user_id(event)
+
+    try:
+        product_id = _parse_cart_product_id(event)
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid productId in path", status=400)
+
+    body = event.get("body", "{}")
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        return err("Request body is not valid JSON", status=400)
+
+    try:
+        request = parse_update_cart_item_request(data)
+    except ValidationError as e:
+        return err(str(e), status=422)
+
+    try:
+        cart = _get_service().update_cart_item(user_id, product_id, request.quantity)
+        return ok({"cart": cart})
+    except ValidationError as e:
+        return err(str(e), status=422)
+    except Exception:
+        logger.exception("Error updating cart item")
+        return err("Internal server error", status=500)
+
+
+def _handle_remove_cart_item(event: dict) -> dict:
+    """DELETE /cart/items/{productId}"""
+    user_id = resolve_user_id(event)
+
+    try:
+        product_id = _parse_cart_product_id(event)
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid productId in path", status=400)
+
+    try:
+        cart = _get_service().remove_cart_item(user_id, product_id)
+        return ok({"cart": cart})
+    except ValidationError as e:
+        return err(str(e), status=422)
+    except Exception:
+        logger.exception("Error removing cart item")
+        return err("Internal server error", status=500)
+
+
+def _handle_checkout_cart(event: dict) -> dict:
+    """POST /cart/{orderId}/checkout"""
+    user_id = resolve_user_id(event)
+
+    try:
+        order_id = event["pathParameters"]["orderId"]
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise ValueError("empty orderId")
+    except (KeyError, TypeError, ValueError):
+        return err("Invalid orderId in path", status=400)
+
+    body = event.get("body", "{}")
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        return err("Request body is not valid JSON", status=400)
+
+    try:
+        request = parse_checkout_cart_request(data)
+    except ValidationError as e:
+        return err(str(e), status=422)
+
+    try:
+        result = _get_service().checkout_cart(user_id, order_id, request)
+    except ValidationError as e:
+        return err(str(e), status=422)
+    except ClientError:
+        logger.exception("Infrastructure error checking out cart")
+        return err("Internal server error", status=500)
+    except Exception:
+        logger.exception("Unexpected error checking out cart")
+        return err("Internal server error", status=500)
+
+    return ok({
+        "message": "Order created. Payment is being processed.",
+        "order":   result,
+    }, status=201)
+
+
+def _handle_claim_cart(event: dict) -> dict:
+    """
+    POST /cart/claim — behind the Cognito authorizer (template.yaml), so the
+    caller's identity comes from API Gateway's already-verified claims, not
+    from the request body. Merges/re-keys the guest cart named in the body
+    onto that identity.
+    """
+    authenticated_user_id = resolve_authenticated_user_id(event)
+
+    body = event.get("body", "{}")
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        return err("Request body is not valid JSON", status=400)
+
+    try:
+        request = parse_claim_cart_request(data)
+    except ValidationError as e:
+        return err(str(e), status=422)
+
+    try:
+        cart = _get_service().claim_guest_cart(authenticated_user_id, request.guest_id)
+        return ok({"cart": cart})
+    except Exception:
+        logger.exception("Error claiming guest cart")
         return err("Internal server error", status=500)

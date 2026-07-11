@@ -37,7 +37,7 @@ import os
 from decimal import Decimal
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
@@ -108,6 +108,108 @@ class DynamoDBClient:
         tracking = sorted((r for r in rows if r["sk"].startswith("TRACKING#")), key=lambda r: r["sk"])
         return {"order": order, "items": items, "tracking": tracking}
 
+    def get_open_cart(self, user_id: str) -> dict | None:
+        """
+        UserOrdersIndex is sparse (only "ORDER" sk rows carry user_id), so a
+        Query here can only ever return ORDER rows — filtering on status
+        narrows it down to the one open cart, if any.
+        """
+        resp = self.orders_table.query(
+            IndexName="UserOrdersIndex",
+            KeyConditionExpression=Key("user_id").eq(user_id),
+            FilterExpression=Attr("status").eq("cart"),
+        )
+        items = resp.get("Items", [])
+        return items[0] if items else None
+
+    # ------------------------------------------------------------------
+    # Cart — writes
+    #
+    # Cart item children are keyed by product_id directly (sk =
+    # "ITEM#<product_id>") rather than the positional "ITEM#0000" scheme
+    # finalized orders use below — a cart needs "does this product already
+    # have a line?" to be a cheap GetItem, not a scan of every child. Both
+    # schemes share the "ITEM#" prefix so get_order_with_children() (and
+    # anything else that only checks that prefix) doesn't need to care
+    # which one produced a given row.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cart_item_key(order_id: str, product_id: str) -> dict:
+        return {"order_id": order_id, "sk": f"ITEM#{product_id}"}
+
+    def create_cart_order(self, order_item: dict) -> None:
+        self.orders_table.put_item(
+            Item=order_item,
+            ConditionExpression="attribute_not_exists(order_id)",
+        )
+
+    def get_cart_item(self, order_id: str, product_id: str) -> dict | None:
+        resp = self.orders_table.get_item(Key=self._cart_item_key(order_id, product_id))
+        return resp.get("Item")
+
+    def put_cart_item(self, item: dict) -> None:
+        self.orders_table.put_item(Item=item)
+
+    def delete_cart_item(self, order_id: str, product_id: str) -> None:
+        self.orders_table.delete_item(Key=self._cart_item_key(order_id, product_id))
+
+    def touch_cart_order(self, order_id: str) -> None:
+        self.orders_table.update_item(
+            Key={"order_id": order_id, "sk": "ORDER"},
+            UpdateExpression="SET updated_at = :now",
+            ExpressionAttributeValues={":now": _now_iso()},
+        )
+
+    def reassign_cart_owner(self, order_id: str, new_user_id: str) -> None:
+        self.orders_table.update_item(
+            Key={"order_id": order_id, "sk": "ORDER"},
+            UpdateExpression="SET user_id = :uid, updated_at = :now",
+            ConditionExpression="attribute_exists(order_id)",
+            ExpressionAttributeValues={":uid": new_user_id, ":now": _now_iso()},
+        )
+
+    def delete_order_with_items(self, order_id: str, item_sks: list[str]) -> None:
+        """
+        Delete the ORDER row and its ITEM# children. Not transactional —
+        this only ever runs against an already-merged, about-to-be-discarded
+        guest cart (see OrderService.claim_guest_cart), so a partial failure
+        just leaves a harmless orphaned row behind rather than risking any
+        real inconsistency.
+        """
+        self.orders_table.delete_item(Key={"order_id": order_id, "sk": "ORDER"})
+        for sk in item_sks:
+            self.orders_table.delete_item(Key={"order_id": order_id, "sk": sk})
+
+    def finalize_cart_order(self, order_id: str, order_updates: dict) -> None:
+        """
+        Plain (non-transactional) update of the ORDER row's attributes —
+        used by cart checkout, which never needs to touch item children in
+        the same write (they're already correct from cart-building, unlike
+        update_order_transaction()'s callers, which can replace them). The
+        status="cart" condition doubles as an optimistic-concurrency guard
+        against a cart being checked out twice concurrently — raises
+        ClientError(ConditionalCheckFailedException) if it's already been
+        claimed by another checkout.
+        """
+        update_expr_parts = []
+        expr_names = {"#cart_status": "status"}
+        expr_values = {":cart_status": "cart"}
+        for i, (k, v) in enumerate(order_updates.items()):
+            name_ph = f"#f{i}"
+            value_ph = f":v{i}"
+            update_expr_parts.append(f"{name_ph} = {value_ph}")
+            expr_names[name_ph] = k
+            expr_values[value_ph] = v
+
+        self.orders_table.update_item(
+            Key={"order_id": order_id, "sk": "ORDER"},
+            UpdateExpression="SET " + ", ".join(update_expr_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+            ConditionExpression="attribute_exists(order_id) AND #cart_status = :cart_status",
+        )
+
     # ------------------------------------------------------------------
     # Orders — writes
     # ------------------------------------------------------------------
@@ -158,6 +260,19 @@ class DynamoDBClient:
         
         # Now decrement stock non-transactionally (risk: partial decrements if Lambda fails,
         # but products table will self-correct via the periodic stock sync job)
+        self.decrement_stock(stock_decrements)
+
+    def decrement_stock(self, stock_decrements: list[dict]) -> None:
+        """
+        Best-effort, non-transactional stock decrement, conditioned on
+        sufficient stock being available per product. Used both right after
+        an order is created and when a cart is checked out — in both cases
+        the order/order-items are already persisted by the time this runs,
+        so a failure here logs and moves on rather than raising (stock
+        inconsistency self-corrects via the periodic sync job).
+
+        stock_decrements: [{"product_id": str, "quantity": int}, ...]
+        """
         for dec in stock_decrements:
             try:
                 self.products_table.update_item(
@@ -167,9 +282,6 @@ class DynamoDBClient:
                     ExpressionAttributeValues={":q": int(dec["quantity"])},
                 )
             except ClientError as e:
-                # Log the failure but don't fail the order — the order is already
-                # persisted, and the payment Lambda will handle it. Stock inconsistency
-                # will be fixed by the periodic sync job.
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     import logging
                     logging.warning(f"Stock race on product {dec['product_id']}: insufficient stock after order created")
