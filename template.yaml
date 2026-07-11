@@ -559,10 +559,10 @@ Resources:
   # ----------------------------------------------------------
   # Payments Lambda  —  charge / refund via EventBridge
   #
-  # NOT YET MIGRATED (code still assumes Postgres) — but RDS itself has
-  # been decommissioned, so there is nothing left to connect to. This
-  # function's code needs to move to DynamoDB before it will work again;
-  # the table env vars/policies below are already in place for that.
+  # Migrated to DynamoDB (lambdas/payments_api/db.py) — reads an order +
+  # its user's email, invokes StripeIntentFunction, and records a payment
+  # attempt (payments table, sk="PAYMENT#<intent_id>") so
+  # stripe_webhook can find it later via ProviderTxnIndex.
   # ----------------------------------------------------------
   PaymentsApiFunction:
     Type: AWS::Serverless::Function
@@ -576,19 +576,14 @@ Resources:
           STRIPE_INTENT_FUNCTION_ARN: !GetAtt StripeIntentFunction.Arn
           PAYMENTS_TABLE_NAME:        !Ref PaymentsTableName
           ORDERS_TABLE_NAME:          !Ref OrdersTableName
+          USERS_TABLE_NAME:           !Ref UsersTableName
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref PaymentsTableName
-        - DynamoDBCrudPolicy:
+        - DynamoDBReadPolicy:
             TableName: !Ref OrdersTableName
-        - Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:TransactWriteItems
-              Resource:
-                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${PaymentsTableName}"
-                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}"
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTableName
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
         - LambdaInvokePolicy:
@@ -610,10 +605,9 @@ Resources:
   # ----------------------------------------------------------
   # Stripe Webhook Lambda  —  listens for Stripe events
   #
-  # NOT YET MIGRATED (code still assumes Postgres) — but RDS itself has
-  # been decommissioned, so there is nothing left to connect to. This
-  # function's code needs to move to DynamoDB before it will work again;
-  # the table env vars/policies below are already in place for that.
+  # Migrated to DynamoDB (lambdas/stripe_webhook/db.py) — updates the
+  # order's status directly and, via ProviderTxnIndex, the matching
+  # payment record payments_api wrote when the intent was created.
   #
   # Must stay excluded from attach-cognito-authorizer.sh — Stripe
   # calls this directly and signs the request with its own webhook
@@ -643,14 +637,6 @@ Resources:
             TableName: !Ref PaymentsTableName
         - DynamoDBCrudPolicy:
             TableName: !Ref OrdersTableName
-        - Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:TransactWriteItems
-              Resource:
-                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${PaymentsTableName}"
-                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OrdersTableName}"
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
       Events:
