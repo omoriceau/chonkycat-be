@@ -4,11 +4,21 @@ users/lambda_handler.py
 Entry point for the Users API.
 
 Routes:
-  GET    /users            List users (supports ?limit=&offset=&role=&status=)
-  GET    /users/{userId}   Fetch a single user
-  POST   /users            Create a user
-  PUT    /users/{userId}   Update a user (partial)
-  DELETE /users/{userId}   Delete a user
+  GET    /users                  List users (supports ?limit=&offset=&role=&status=)
+  GET    /users/{userId}         Self-service: a signed-in shopper fetching their own
+                                  profile (customer Cognito pool; sub must equal userId)
+  PUT    /users/{userId}         Self-service: same shopper updating their own profile
+                                  (email/role/status are off-limits — see
+                                  _SELF_SERVICE_FORBIDDEN_FIELDS)
+  POST   /users                  Create a user (admin)
+  GET    /admin/users/{userId}   Admin: fetch any user
+  PUT    /admin/users/{userId}   Admin: update any user, including email/role/status
+  DELETE /users/{userId}         Delete a user (admin)
+
+/users/{userId} and /admin/users/{userId} share the same {userId} path param
+name and the same underlying service calls — only the auth pool (see
+template.yaml) and the self-only / forbidden-fields restrictions differ,
+gated by the `admin` flag threaded through _handle_get_user/_handle_update_user.
 
 Environment Variables:
   - USERS_TABLE_NAME     DynamoDB table name (aws_dynamodb_table.users.name)
@@ -110,13 +120,19 @@ def lambda_handler(event: dict, context) -> dict:
 
     method = event.get("httpMethod", "")
     has_path_id = bool((event.get("pathParameters") or {}).get("userId"))
+    # "resource" (REST API v1) / "path" (fallback) — distinguishes the admin
+    # routes from the self-service ones sharing the same {userId} param name.
+    resource = event.get("resource") or event.get("path") or ""
+    is_admin_route = "/admin/users" in resource
 
     if method == "GET":
-        return _handle_get_user(event) if has_path_id else _handle_list_users(event)
+        if has_path_id:
+            return _handle_get_user(event, admin=is_admin_route)
+        return _handle_list_users(event)
     elif method == "POST":
         return _handle_create_user(event)
     elif method == "PUT":
-        return _handle_update_user(event)
+        return _handle_update_user(event, admin=is_admin_route)
     elif method == "DELETE":
         return _handle_delete_user(event)
     else:
@@ -154,16 +170,17 @@ def _require_self(event: dict, user_id: str) -> dict | None:
     return None
 
 
-def _handle_get_user(event: dict) -> dict:
-    """GET /users/{userId}"""
+def _handle_get_user(event: dict, admin: bool = False) -> dict:
+    """GET /users/{userId} (self-service) or GET /admin/users/{userId} (admin)"""
     try:
         user_id = _parse_user_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
 
-    forbidden = _require_self(event, user_id)
-    if forbidden:
-        return forbidden
+    if not admin:
+        forbidden = _require_self(event, user_id)
+        if forbidden:
+            return forbidden
 
     try:
         result = _get_service().get_user(user_id)
@@ -232,16 +249,17 @@ def _handle_create_user(event: dict) -> dict:
 _SELF_SERVICE_FORBIDDEN_FIELDS = ("email", "role", "status")
 
 
-def _handle_update_user(event: dict) -> dict:
-    """PUT /users/{userId}"""
+def _handle_update_user(event: dict, admin: bool = False) -> dict:
+    """PUT /users/{userId} (self-service) or PUT /admin/users/{userId} (admin)"""
     try:
         user_id = _parse_user_id(event)
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
 
-    forbidden = _require_self(event, user_id)
-    if forbidden:
-        return forbidden
+    if not admin:
+        forbidden = _require_self(event, user_id)
+        if forbidden:
+            return forbidden
 
     body = event.get("body", "{}")
     try:
@@ -249,9 +267,10 @@ def _handle_update_user(event: dict) -> dict:
     except json.JSONDecodeError:
         return err("Request body is not valid JSON", status=400)
 
-    disallowed = [f for f in _SELF_SERVICE_FORBIDDEN_FIELDS if f in data]
-    if disallowed:
-        return err(f"Cannot self-update field(s): {', '.join(disallowed)}", status=403)
+    if not admin:
+        disallowed = [f for f in _SELF_SERVICE_FORBIDDEN_FIELDS if f in data]
+        if disallowed:
+            return err(f"Cannot self-update field(s): {', '.join(disallowed)}", status=403)
 
     try:
         update = parse_update_user_request(data)

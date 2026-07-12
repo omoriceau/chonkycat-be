@@ -50,11 +50,14 @@ def fake_service(monkeypatch):
 
 @pytest.fixture
 def make_event():
-    def _make(method, user_id=None, body=None, authenticated_sub=None):
+    def _make(method, user_id=None, body=None, authenticated_sub=None, resource=None):
         event = {
             "httpMethod": method,
             "pathParameters": {"userId": user_id} if user_id else None,
         }
+        if resource is not None:
+            event["resource"] = resource
+            event["path"] = resource.replace("{userId}", user_id or "")
         if body is not None:
             event["body"] = json.dumps(body)
         if authenticated_sub is not None:
