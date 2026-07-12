@@ -2,7 +2,9 @@
 orders/lambda_handler.py
 
 Entry points:
-  POST/GET/PUT/DELETE /orders          one-shot order placement (unchanged)
+  GET    /orders                       admin list (see _handle_list_orders for query params)
+  POST   /orders                       one-shot order placement
+  GET/PUT/DELETE /orders/{orderId}     fetch/update/soft-delete a single order
   GET    /cart                         fetch the caller's open cart
   POST   /cart/items                   add (or increment) a cart line item
   PUT    /cart/items/{productId}       set a cart line item's quantity
@@ -142,9 +144,11 @@ def lambda_handler(event: dict, context) -> dict:
     if resource.startswith("/cart"):
         return _handle_cart_request(event, resource, method)
 
+    has_order_id = bool((event.get("pathParameters") or {}).get("orderId"))
+
     # Route based on HTTP method
     if method == "GET":
-        return _handle_get_order(event)
+        return _handle_list_orders(event) if not has_order_id else _handle_get_order(event)
     elif method == "POST":
         return _handle_create_order(event)
     elif method == "PUT":
@@ -177,6 +181,61 @@ def _handle_get_order(event: dict) -> dict:
         return ok({"order": result})
     except Exception:
         logger.exception("Error retrieving order")
+        return err("Internal server error", status=500)
+
+
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+
+
+def _parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+def _parse_int(value: str | None, default: int, min_val: int, max_val: int | None = None) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    n = max(n, min_val)
+    if max_val is not None:
+        n = min(n, max_val)
+    return n
+
+
+def _handle_list_orders(event: dict) -> dict:
+    """
+    GET /orders
+
+    Query Parameters:
+      - page            (int,  default 1)
+      - page_size       (int,  default 50, max 200)
+      - status          (str,  optional)  — e.g. "pending", "completed", "failed"; "cart" also
+                                             works but is otherwise excluded (see include_carts)
+      - include_deleted (bool, default false) — include soft-deleted orders
+      - include_carts   (bool, default false) — include open (unchecked-out) carts
+    """
+    params = event.get("queryStringParameters") or {}
+
+    page = _parse_int(params.get("page"), default=1, min_val=1)
+    page_size = _parse_int(params.get("page_size"), default=DEFAULT_PAGE_SIZE, min_val=1, max_val=MAX_PAGE_SIZE)
+    status = (params.get("status") or "").strip() or None
+    include_deleted = _parse_bool(params.get("include_deleted"))
+    include_carts = _parse_bool(params.get("include_carts"))
+
+    try:
+        result = _get_service().list_orders(
+            page=page,
+            page_size=page_size,
+            status=status,
+            include_deleted=include_deleted,
+            include_carts=include_carts,
+        )
+        return ok(result)
+    except Exception:
+        logger.exception("Error listing orders")
         return err("Internal server error", status=500)
 
 

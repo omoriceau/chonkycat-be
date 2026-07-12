@@ -108,6 +108,34 @@ class DynamoDBClient:
         tracking = sorted((r for r in rows if r["sk"].startswith("TRACKING#")), key=lambda r: r["sk"])
         return {"order": order, "items": items, "tracking": tracking}
 
+    SCAN_PAGE_SIZE = 100
+
+    def scan_all_orders(self) -> list[dict]:
+        """
+        Full table scan — returns every row (ORDER records AND their ITEM#/
+        TRACKING# children) across every order. Neither GSI spans "all
+        orders" (UserOrdersIndex is per-user, StatusIndex is per-status), so
+        this is the unavoidable option for a flat admin list — same
+        tradeoff products/db.py's scan_all already accepts at catalog scale.
+        Callers are expected to split ORDER rows from children themselves
+        (see OrderService.list_orders), the same way get_order_with_children
+        does for a single order.
+
+        Still fetches every row overall — Limit just bounds each individual
+        Scan call to SCAN_PAGE_SIZE items (DynamoDB's own per-call cap is
+        ~1MB, not row count) rather than one huge read per round trip.
+        """
+        items = []
+        kwargs = {"Limit": self.SCAN_PAGE_SIZE}
+        while True:
+            resp = self.orders_table.scan(**kwargs)
+            items.extend(resp.get("Items", []))
+            last_key = resp.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            kwargs["ExclusiveStartKey"] = last_key
+        return items
+
     def get_open_cart(self, user_id: str) -> dict | None:
         """
         UserOrdersIndex is sparse (only "ORDER" sk rows carry user_id), so a
