@@ -95,6 +95,72 @@ class OrderService:
 
         return self._order_to_response(order, result["items"])
 
+    def list_orders(
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        status: str | None = None,
+        include_deleted: bool = False,
+        include_carts: bool = False,
+    ) -> dict:
+        """
+        Admin listing — deliberately minimal per-order fields (order_id,
+        user_id, status, item_count, total, created_at). No shipping
+        address, customer_notes, customer_email, or payment details here;
+        those stay behind the single-order GET, same as the storefront
+        never gets a "browse everyone's orders" view of its own.
+
+        Open carts (status="cart") are excluded by default — they aren't
+        placed orders yet — unless include_carts is set or a caller asks
+        for status="cart" explicitly.
+        """
+        rows = self._db.scan_all_orders()
+
+        orders_by_id: dict[str, dict] = {}
+        item_counts: dict[str, int] = {}
+        for row in rows:
+            if row["sk"] == "ORDER":
+                orders_by_id[row["order_id"]] = row
+            elif row["sk"].startswith("ITEM#"):
+                item_counts[row["order_id"]] = item_counts.get(row["order_id"], 0) + 1
+
+        show_carts = include_carts or status == "cart"
+        summaries = []
+        for order_id, order in orders_by_id.items():
+            if order.get("deleted_at") and not include_deleted:
+                continue
+            if order.get("status") == "cart" and not show_carts:
+                continue
+            if status and order.get("status") != status:
+                continue
+            summaries.append({
+                "order_id": order_id,
+                "user_id": order.get("user_id"),
+                "status": order.get("status"),
+                "item_count": item_counts.get(order_id, 0),
+                "total": str(order["total_amount"]) if order.get("total_amount") is not None else None,
+                "created_at": order.get("created_at"),
+            })
+
+        summaries.sort(key=lambda o: o["created_at"] or "", reverse=True)
+
+        total_items = len(summaries)
+        total_pages = max(1, -(-total_items // page_size))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        return {
+            "data": summaries[start:end],
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_items,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1,
+            },
+        }
+
     def delete_order(self, order_id: str) -> bool:
         """
         Soft delete an order by setting a deleted_at timestamp.
