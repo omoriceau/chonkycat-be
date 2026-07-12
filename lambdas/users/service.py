@@ -163,6 +163,16 @@ class UserService:
             if value is not None:
                 updates[column] = value
 
+        # address is the one field where `None` is a meaningful value
+        # (delete the saved address) rather than "leave it alone" — so it's
+        # keyed off address_provided instead of an is-not-None check.
+        remove_keys = []
+        if update.address_provided:
+            if update.address is None:
+                remove_keys.append("address")
+            else:
+                updates["address"] = update.address
+
         new_email = update.email if update.email is not None else None
         email_changed = new_email is not None and new_email != existing["email"]
 
@@ -178,6 +188,7 @@ class UserService:
                 updates,
                 current_email=existing["email"],
                 new_email=new_email,
+                remove_keys=remove_keys,
             )
         except self._EmailAlreadyExists:
             if email_changed:
@@ -321,6 +332,7 @@ class UserService:
             "first_name": item.get("first_name"),
             "last_name":  item.get("last_name"),
             "phone":      item.get("phone"),
+            "address":    item.get("address"),
             "role":       item.get("role"),
             "status":     item.get("status"),
             "created_at": item.get("created_at"),

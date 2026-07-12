@@ -27,6 +27,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ALLOWED_ROLES   = {"customer", "admin", "staff"}
 ALLOWED_STATUSES = {"active", "inactive", "suspended"}
 
+ADDRESS_FIELDS = ("address1", "city", "province", "postal_code", "country")
+
 # Mirrors the Cognito User Pool's password policy (chonkychonk-admin). Kept
 # in sync manually — if the pool policy changes, update this too so bad
 # passwords are rejected here instead of round-tripping to Cognito first.
@@ -59,6 +61,11 @@ class UpdateUserRequest:
     phone:      Optional[str] = None
     role:       Optional[str] = None
     status:     Optional[str] = None
+    # Optional[dict], but None is ambiguous between "not touching the
+    # address" and "clear it" — address_provided disambiguates (mirrors
+    # how `"address" in data` is checked in parse_update_user_request).
+    address:          Optional[dict] = None
+    address_provided: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +109,21 @@ def _validate_password(password: str) -> str:
     return password
 
 
+def _validate_address(value) -> Optional[dict]:
+    """None means "no shipping address on file" (or "delete the one that's
+    there") — a valid, explicit state, not a missing field."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("'address' must be an object or null")
+
+    address1 = str(value.get("address1", "")).strip()
+    if not address1:
+        raise ValidationError("'address' must include a street address")
+
+    return {field: str(value.get(field, "")).strip() for field in ADDRESS_FIELDS}
+
+
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
@@ -127,12 +149,13 @@ def parse_create_user_request(data: dict) -> CreateUserRequest:
 def parse_update_user_request(data: dict) -> UpdateUserRequest:
     """
     Allows partial updates: any subset of email, first_name, last_name,
-    phone, role, status.
+    phone, address, role, status. `address: null` explicitly clears a
+    saved shipping address rather than being ignored as "not provided".
     """
     if not data:
         raise ValidationError(
             "At least one field must be provided for update "
-            "(email, first_name, last_name, phone, role, status)"
+            "(email, first_name, last_name, phone, address, role, status)"
         )
 
     update = UpdateUserRequest()
@@ -145,6 +168,9 @@ def parse_update_user_request(data: dict) -> UpdateUserRequest:
         update.last_name = data.get("last_name")
     if "phone" in data:
         update.phone = data.get("phone")
+    if "address" in data:
+        update.address = _validate_address(data.get("address"))
+        update.address_provided = True
     if "role" in data:
         update.role = _validate_role(str(_require(data, "role")))
     if "status" in data:

@@ -22,7 +22,7 @@ import re
 _ALLOWED_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)*chonkycat\.ca$")
 
 DEFAULT_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-DEFAULT_ALLOW_HEADERS = "Content-Type, Authorization"
+DEFAULT_ALLOW_HEADERS = "Content-Type, Authorization, X-Guest-Id"
 
 
 def _get_origin(event: dict) -> str | None:
