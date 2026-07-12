@@ -227,13 +227,21 @@ Resources:
   # Products Lambda  —  full CRUD: GET/POST/PUT/PATCH/DELETE
   # /products and /products/{productid}. DynamoDB, no VPC.
   #
+  # Image uploads (POST .../image) write into chonky-images-<env> — the
+  # same bucket chonky-cat-fe's scripts/push-images.mjs provisions and
+  # serves at https://img.chonkycat.ca. That bucket is created imperatively
+  # (aws s3api, not IaC) and its bucket policy already grants public
+  # GetObject on img/* — it is NOT declared as a stack resource here, only
+  # referenced by name, the same way the EventBridge bus above is. This
+  # Lambda only needs PutObject on that one prefix; reads are public.
+  #
   # Auth is not configured in this template (see the
   # ChonkyRestApi comment above) — it's attached externally
   # via scripts/attach-cognito-authorizer.sh, which needs an
   # entry for each of CreateProduct/UpdateProduct/PatchProduct/
-  # DeleteProduct below, while leaving GetProducts and
-  # GetProductById public so the storefront can browse/view
-  # products without signing in.
+  # DeleteProduct/UploadProductImage/UploadImageForSku below, while leaving
+  # GetProducts and GetProductById public so the storefront can
+  # browse/view products without signing in.
   # ----------------------------------------------------------
   ProductsFunction:
     Type: AWS::Serverless::Function
@@ -244,10 +252,18 @@ Resources:
       Description:  Product catalog CRUD - GET (public) / POST/PUT/PATCH/DELETE (authenticated) /products
       Environment:
         Variables:
-          PRODUCTS_TABLE_NAME: !Ref ProductsTableName
+          PRODUCTS_TABLE_NAME:   !Ref ProductsTableName
+          PRODUCT_IMAGES_BUCKET: !Sub chonky-images-${Environment}
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ProductsTableName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource:
+                - !Sub "arn:aws:s3:::chonky-images-${Environment}/img/*"
       Events:
         GetProducts:
           Type: Api
@@ -285,6 +301,30 @@ Resources:
             RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: DELETE
+        UploadProductImage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/{productid}/image
+            Method: POST
+        ProductImagePreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/{productid}/image
+            Method: OPTIONS
+        UploadImageForSku:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/image
+            Method: POST
+        UploadImageForSkuPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/image
+            Method: OPTIONS
         ProductsPreflight:
           Type: Api
           Properties:
@@ -405,6 +445,15 @@ Resources:
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBusName
       Events:
+        # No explicit Auth block — same as GetUsers, so it picks up the
+        # general admin Cognito authorizer via attach-cognito-authorizer.sh.
+        # Order data (even the list's minimal fields) isn't public.
+        GetOrders:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /orders
+            Method: GET
         PostOrders:
           Type: Api
           Properties:
@@ -577,6 +626,15 @@ Resources:
         # path, so nobody can read/edit anyone else's profile just by
         # knowing their id. GetUsers/PostUsers/DeleteUser are unrelated
         # admin operations and stay as they were.
+        #
+        # The admin panel does NOT use these — it can't: its tokens come
+        # from the chonkychonk-admin pool, not this customer one, so
+        # they'd be rejected by CustomerCognitoAuthorizer before even
+        # reaching the self-sub check. It uses AdminGetUserById/AdminPutUser
+        # below instead (same {userId} shape, no self-only restriction,
+        # under the general admin Cognito authorizer attached externally
+        # via attach-cognito-authorizer.sh — same as GetUsers/PostUsers/
+        # DeleteUser).
         GetUserById:
           Type: Api
           Properties:
@@ -617,6 +675,29 @@ Resources:
             RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: DELETE
+        # Admin equivalents of GetUserById/PutUser — see the comment on
+        # GetUserById above. No explicit Auth block, same as GetUsers/
+        # PostUsers/DeleteUser: attach-cognito-authorizer.sh attaches the
+        # admin (chonkychonk-admin pool) authorizer to these by default,
+        # since they're not in its public-route exclude list.
+        AdminGetUserById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /admin/users/{userId}
+            Method: GET
+        AdminPutUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /admin/users/{userId}
+            Method: PUT
+        AdminUserByIdPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /admin/users/{userId}
+            Method: OPTIONS
         UsersPreflight:
           Type: Api
           Properties:

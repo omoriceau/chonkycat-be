@@ -18,11 +18,13 @@ from moto import mock_aws
 
 # Must be set before db.py's get_db_client() reads them.
 os.environ.setdefault("PRODUCTS_TABLE_NAME", "products-test")
+os.environ.setdefault("PRODUCT_IMAGES_BUCKET", "chonky-images-test")
 os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 
 TABLE_NAME = "products-test"
+IMAGES_BUCKET = os.environ["PRODUCT_IMAGES_BUCKET"]
 
 
 @pytest.fixture
@@ -74,15 +76,30 @@ def db(dynamodb_table):
 
 
 @pytest.fixture
+def images_bucket(dynamodb_table):
+    """Creates the mocked S3 bucket handlers/image.py uploads into. Depends
+    on dynamodb_table (rather than starting its own mock_aws()) so both
+    live inside the same moto mock context — moto mocks per-context, not
+    per-service, so a second `with mock_aws():` here would just shadow the
+    first and leave the DynamoDB table looking gone to any code running
+    inside it."""
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=IMAGES_BUCKET)
+    return IMAGES_BUCKET
+
+
+@pytest.fixture
 def make_event():
     """Factory for building API Gateway (REST API / v1 shape) events."""
 
-    def _make(method, product_id=None, body=None, qs=None):
+    def _make(method, product_id=None, body=None, qs=None, resource=None):
         event = {
             "httpMethod": method,
             "pathParameters": {"productid": product_id} if product_id else None,
             "queryStringParameters": qs,
         }
+        if resource is not None:
+            event["resource"] = resource
+            event["path"] = resource.replace("{productid}", product_id or "")
         if body is not None:
             event["body"] = json.dumps(body)
         return event
