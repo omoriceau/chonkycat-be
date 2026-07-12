@@ -14,7 +14,7 @@ die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # ==============================================================================
 # Argument parsing
 #
-# Usage: $0 [--environment dev|staging|prod] [--region REGION] [--dev-email EMAIL] [--cors]
+# Usage: $0 [--environment dev|staging|prod] [--region REGION] [--dev-email EMAIL] [--cors] [--ses-domain DOMAIN]
 #
 # All flags are optional and order-independent. Both "--flag value" and
 # "--flag=value" forms are accepted. Run with --help for details.
@@ -33,13 +33,50 @@ Options:
   --cors                                    Enable permissive CORS (Access-Control-
                                              Allow-Origin: *). Only allowed with
                                              --environment dev.
+  --ses-domain <domain>                     Domain to set up in SES for sending
+                                             notification emails (creates/verifies
+                                             the domain identity + DKIM, plus
+                                             no-reply@<domain> and test@<domain>
+                                             email identities). Can also be set
+                                             via the SES_DOMAIN env var. Omit to
+                                             skip SES setup entirely.
+  --admin-cognito-pool-id <id>               Cognito pool the Users Lambda uses
+                                             for AdminCreateUser (staff/admin
+                                             accounts). Also settable via
+                                             ADMIN_COGNITO_USER_POOL_ID.
+                                             Default: chonkychonk-admin's pool.
+  --customer-cognito-pool-id <id>            Cognito pool backing the storefront's
+                                             Amplify Authenticator (chonky-cat-fe)
+                                             — verifies cart/profile bearer
+                                             tokens and authorizes POST
+                                             /cart/claim + self-service profile
+                                             routes. Also settable via
+                                             CUSTOMER_COGNITO_USER_POOL_ID.
+  --customer-cognito-client-id <id>          App client id for the pool above.
+                                             Also settable via
+                                             CUSTOMER_COGNITO_APP_CLIENT_ID.
   -h, --help                                Show this help and exit
+
+Environment variables (SES/Cloudflare):
+  SES_DOMAIN                Same as --ses-domain, used if the flag isn't passed.
+  CLOUDFLARE_API_TOKEN      Optional. If set together with CLOUDFLARE_ZONE_ID,
+                             the DKIM CNAME records SES needs are created/updated
+                             directly in Cloudflare. Requires 'jq'.
+  CLOUDFLARE_ZONE_ID        Optional, see above.
+
+Environment variables (Cognito):
+  ADMIN_COGNITO_USER_POOL_ID       Same as --admin-cognito-pool-id.
+  CUSTOMER_COGNITO_USER_POOL_ID    Same as --customer-cognito-pool-id.
+  CUSTOMER_COGNITO_APP_CLIENT_ID   Same as --customer-cognito-client-id.
 
 Examples:
   $0
   $0 --environment staging --region eu-west-1
   $0 --env dev --cors
   $0 --environment=prod --region=us-east-1 --dev-email=alerts@chonkychonk.com
+  $0 --ses-domain chonkycat.ca
+  CLOUDFLARE_API_TOKEN=xxx CLOUDFLARE_ZONE_ID=yyy $0 --ses-domain chonkycat.ca
+  $0 --customer-cognito-pool-id us-east-1_RN8iM0OaC --customer-cognito-client-id 607ej6ubfsn7o6q131f60f4kfc
 EOF
 }
 
@@ -47,6 +84,16 @@ ENVIRONMENT="dev"
 REGION_ARG=""
 DEV_EMAIL="dev@example.com"
 ALLOW_CORS=true
+SES_DOMAIN="${SES_DOMAIN:-}"
+# Defaults match this account's actual pools (see `aws cognito-idp
+# list-user-pools`) — chonkychonk-admin is a long-lived, rarely-changing
+# resource so it's safe to default; the customer pool is Amplify-managed
+# and its id/client id can change if that backend is ever torn down and
+# re-sandboxed, so double-check these against `amplify_outputs.json` in
+# chonky-cat-fe if profile/cart auth starts failing after an Amplify redeploy.
+ADMIN_COGNITO_USER_POOL_ID="${ADMIN_COGNITO_USER_POOL_ID:-us-east-1_tzozLyJBF}"
+CUSTOMER_COGNITO_USER_POOL_ID="${CUSTOMER_COGNITO_USER_POOL_ID:-us-east-1_RN8iM0OaC}"
+CUSTOMER_COGNITO_APP_CLIENT_ID="${CUSTOMER_COGNITO_APP_CLIENT_ID:-607ej6ubfsn7o6q131f60f4kfc}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,6 +127,42 @@ while [[ $# -gt 0 ]]; do
     --cors)
       ALLOW_CORS=true
       shift
+      ;;
+    --ses-domain=*)
+      SES_DOMAIN="${1#*=}"
+      shift
+      ;;
+    --ses-domain)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      SES_DOMAIN="$2"
+      shift 2
+      ;;
+    --admin-cognito-pool-id=*)
+      ADMIN_COGNITO_USER_POOL_ID="${1#*=}"
+      shift
+      ;;
+    --admin-cognito-pool-id)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      ADMIN_COGNITO_USER_POOL_ID="$2"
+      shift 2
+      ;;
+    --customer-cognito-pool-id=*)
+      CUSTOMER_COGNITO_USER_POOL_ID="${1#*=}"
+      shift
+      ;;
+    --customer-cognito-pool-id)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      CUSTOMER_COGNITO_USER_POOL_ID="$2"
+      shift 2
+      ;;
+    --customer-cognito-client-id=*)
+      CUSTOMER_COGNITO_APP_CLIENT_ID="${1#*=}"
+      shift
+      ;;
+    --customer-cognito-client-id)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      CUSTOMER_COGNITO_APP_CLIENT_ID="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -127,6 +210,17 @@ esac
 # for that environment rather than via this shortcut flag.
 if [ "$ALLOW_CORS" = true ] && [ "$ENVIRONMENT" != "dev" ]; then
     die "--cors is only allowed with --environment dev (got '$ENVIRONMENT'). Refusing to deploy permissive CORS to staging/prod."
+fi
+
+# If Cloudflare auto-DNS was requested, make sure we can actually do it
+# (needs jq to parse the API responses) before setup_ses gets there.
+CF_AUTO_DNS=false
+if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ZONE_ID:-}" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    CF_AUTO_DNS=true
+  else
+    warn "CLOUDFLARE_API_TOKEN/CLOUDFLARE_ZONE_ID are set but 'jq' isn't installed — falling back to printing DNS records for manual entry."
+  fi
 fi
 
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
@@ -219,6 +313,122 @@ else
 fi
 
 # ==============================================================================
+# SES: verify a sending domain (+ Easy DKIM) and create no-reply@ / test@
+# email identities under it.
+#
+# Uses SESv2 (`aws sesv2 ...`), not the older `aws ses verify-*` v1 calls —
+# v1's verify-domain-identity/verify-email-identity reset verification
+# state and resend the verification email on every single call, which
+# would make this non-idempotent (re-running the deploy would keep
+# knocking already-verified identities back to pending, or spamming
+# no-reply@/test@ with fresh verification emails). SESv2's
+# create-email-identity is safe to call once per identity; this script
+# additionally checks with get-email-identity first so a second run is a
+# no-op rather than an error.
+#
+# Domain is assumed to be hosted on Cloudflare, not Route53, so this
+# script can't create the DKIM CNAME records for you unless you export
+# CLOUDFLARE_API_TOKEN + CLOUDFLARE_ZONE_ID (needs `jq`, checked above) —
+# otherwise it just prints the records for you to add by hand.
+# ==============================================================================
+
+cf_upsert_cname() {
+  local name="$1" content="$2"
+  local existing_id
+  existing_id=$(curl -sf -X GET \
+      "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=CNAME&name=${name}" \
+      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+    | jq -r '.result[0].id // empty') || { warn "  Cloudflare lookup failed for $name — skipping, add it manually."; return; }
+
+  if [ -n "$existing_id" ]; then
+    curl -sf -X PUT "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${existing_id}" \
+      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"CNAME\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":300,\"proxied\":false}" >/dev/null \
+      && log "  updated CNAME: $name -> $content" \
+      || warn "  failed to update CNAME $name — add it manually."
+  else
+    curl -sf -X POST "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records" \
+      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"CNAME\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":300,\"proxied\":false}" >/dev/null \
+      && log "  created CNAME: $name -> $content" \
+      || warn "  failed to create CNAME $name — add it manually."
+  fi
+}
+
+setup_ses() {
+  if [ -z "$SES_DOMAIN" ]; then
+    warn "No SES domain given — skipping SES setup. Pass --ses-domain <domain> or export SES_DOMAIN=<domain> to enable."
+    return
+  fi
+
+  log "Setting up SES for domain: $SES_DOMAIN"
+
+  # ---- Domain identity (enables Easy DKIM by default) ----
+  if aws sesv2 get-email-identity --email-identity "$SES_DOMAIN" --region "$REGION" >/dev/null 2>&1; then
+    log "SES domain identity $SES_DOMAIN already exists — skipping creation."
+  else
+    log "Creating SES domain identity: $SES_DOMAIN"
+    aws sesv2 create-email-identity \
+        --email-identity "$SES_DOMAIN" \
+        --region "$REGION" >/dev/null
+  fi
+
+  local verified dkim_tokens
+  verified=$(aws sesv2 get-email-identity --email-identity "$SES_DOMAIN" --region "$REGION" \
+      --query 'VerifiedForSendingStatus' --output text)
+  dkim_tokens=$(aws sesv2 get-email-identity --email-identity "$SES_DOMAIN" --region "$REGION" \
+      --query 'DkimAttributes.Tokens' --output text)
+
+  if [ "$verified" = "True" ]; then
+    log "$SES_DOMAIN is verified for sending."
+  else
+    warn "$SES_DOMAIN is not yet verified. Add these CNAME records in Cloudflare DNS (DNS-only / grey cloud, NOT proxied):"
+    for token in $dkim_tokens; do
+      echo "    ${token}._domainkey.${SES_DOMAIN}  CNAME  ${token}.dkim.amazonses.com"
+    done
+    echo "  Verification usually completes within a few minutes to ~72h of the records propagating."
+
+    if [ "$CF_AUTO_DNS" = true ]; then
+      log "Upserting the DKIM CNAME records above directly in Cloudflare..."
+      for token in $dkim_tokens; do
+        cf_upsert_cname "${token}._domainkey.${SES_DOMAIN}" "${token}.dkim.amazonses.com"
+      done
+    else
+      warn "Export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID (and have 'jq' installed) to have this script create those records for you automatically next time."
+    fi
+  fi
+
+  # ---------------------------------------------------------------------
+  # no-reply@ / test@ identities.
+  #
+  # Not strictly required once the domain identity above is verified —
+  # SES will send FROM and accept mail TO any address at a verified
+  # domain. Created explicitly anyway (as requested) so SES shows
+  # per-address identities/metrics for the two addresses this stack
+  # actually uses: no-reply@ as EmailServiceFunction's sender, test@ for
+  # sandbox-mode test recipients. Each still needs its own click-through
+  # verification email — that part is inherently not automatable.
+  # ---------------------------------------------------------------------
+  for local_part in no-reply test; do
+    local identity="${local_part}@${SES_DOMAIN}"
+    if aws sesv2 get-email-identity --email-identity "$identity" --region "$REGION" >/dev/null 2>&1; then
+      log "SES email identity $identity already exists — skipping creation."
+    else
+      log "Creating SES email identity: $identity"
+      aws sesv2 create-email-identity --email-identity "$identity" --region "$REGION" >/dev/null
+      warn "  Verification email sent to $identity — someone with access to that mailbox needs to click the link before it can send/receive."
+    fi
+  done
+
+  log "SES setup done for $SES_DOMAIN."
+}
+
+setup_ses
+
+# ==============================================================================
 # Build
 # ==============================================================================
 
@@ -256,11 +466,18 @@ fi
 
 # Build parameter overrides for all required parameters
 #
-# NOTE: this list is now DynamoDB table names + Stripe/dev-email config
-# only. No DBHost/DBPort/DBUser/DBName/VpcId/SubnetIds/SecurityGroupId/
+# NOTE: this list is now DynamoDB table names + Stripe/dev-email/SES/Cognito
+# config only. No DBHost/DBPort/DBUser/DBName/VpcId/SubnetIds/SecurityGroupId/
 # DBPasswordSecretName — those are gone along with RDS. If template.yaml
 # still lists any of them as Parameters, `sam deploy` will fail demanding a
 # value; go drop them from the template rather than adding them back here.
+#
+# This is the actual, effective source of these parameters' deployed
+# values — samconfig.toml's own parameter_overrides only apply to a bare
+# `sam deploy` with no --parameter-overrides flag, which this script never
+# does (it always passes its own list below, which wins). If a parameter
+# looks right in samconfig.toml but wrong on the deployed stack, this is
+# almost certainly why — keep both in sync manually.
 PARAM_OVERRIDES=(
   "ParameterKey=Environment,ParameterValue=$ENVIRONMENT"
   "ParameterKey=UsersTableName,ParameterValue=$USERS_TABLE_NAME"
@@ -272,6 +489,10 @@ PARAM_OVERRIDES=(
   "ParameterKey=StripeSecretKeySecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_secret_key"
   "ParameterKey=StripeWebhookSecretName,ParameterValue=chonky/${ENVIRONMENT}/stripe_webhook_secret"
   "ParameterKey=DevEmail,ParameterValue=$DEV_EMAIL"
+  "ParameterKey=SesDomain,ParameterValue=$SES_DOMAIN"
+  "ParameterKey=CognitoUserPoolId,ParameterValue=$ADMIN_COGNITO_USER_POOL_ID"
+  "ParameterKey=CustomerCognitoUserPoolId,ParameterValue=$CUSTOMER_COGNITO_USER_POOL_ID"
+  "ParameterKey=CustomerCognitoAppClientId,ParameterValue=$CUSTOMER_COGNITO_APP_CLIENT_ID"
 )
 
 # --cors: passed through as a parameter override. This assumes

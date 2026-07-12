@@ -93,6 +93,24 @@ Parameters:
     Description: Email address for receiving test emails in SES Sandbox mode (dev environment)
 
   # ----------------------------------------------------------
+  # SES sending domain — the Cloudflare-hosted domain that no-reply@
+  # lives under. Set via deploy-products.sh's --ses-domain flag /
+  # SES_DOMAIN env var, which is also what actually provisions the SES
+  # domain + email identities (see setup_ses() there). This parameter
+  # feeds EMAIL_FROM_ADDRESS below — the env var ses_provider.py actually
+  # reads — so EmailServiceFunction sends from an address SES has really
+  # verified, instead of the module's hardcoded stale-domain default.
+  #
+  # Left blank by default so the stack still deploys before SES is set
+  # up; ses_provider.py falls back to its own hardcoded default address
+  # if EMAIL_FROM_ADDRESS comes through empty.
+  # ----------------------------------------------------------
+  SesDomain:
+    Type:    String
+    Default: ""
+    Description: Cloudflare-hosted domain used for SES sending (no-reply@<domain>) — see deploy-products.sh setup_ses()
+
+  # ----------------------------------------------------------
   # DynamoDB table names — Products, Orders, and Users read
   # these now. Payments/Promotions are listed too since Orders
   # already depends on Promotions, and Payments/StripeWebhook
@@ -133,6 +151,11 @@ Conditions:
   # (CustomerCognitoUserPoolId defaults to "") — POST /cart/claim just runs
   # without the Cognito authorizer attached until it's set.
   HasCustomerCognitoPool: !Not [!Equals [!Ref CustomerCognitoUserPoolId, ""]]
+  # Lets the stack deploy before SES has been set up (SesDomain defaults
+  # to "") — EmailServiceFunction just gets an empty EMAIL_FROM_ADDRESS
+  # until setup_ses() in deploy-products.sh has run and this parameter is
+  # passed on a subsequent deploy.
+  HasSesDomain: !Not [!Equals [!Ref SesDomain, ""]]
 
 # ============================================================
 # Resources
@@ -296,6 +319,19 @@ Resources:
       Handler:      lambda_handler.lambda_handler
       Description:  Generic email service for sending emails triggered by EventBridge events
       # No VPC needed — only calls SES API
+      Environment:
+        Variables:
+          # This is the env var ses_provider.py actually reads
+          # (EMAIL_FROM_ADDRESS, not SES_FROM_EMAIL) — populated once
+          # SesDomain is passed, after setup_ses() in deploy-products.sh
+          # has provisioned and verified the underlying SES identity.
+          #
+          # Omitted entirely via AWS::NoValue rather than set to "" when
+          # SES isn't configured yet: os.environ.get()'s own fallback only
+          # kicks in when the key is absent, not when it's present-but-
+          # empty, so "" here would send with a blank FROM address instead
+          # of falling back to ses_provider.py's own hardcoded default.
+          EMAIL_FROM_ADDRESS: !If [HasSesDomain, !Sub "no-reply@${SesDomain}", !Ref AWS::NoValue]
       Policies:
         - Version: '2012-10-17'
           Statement:

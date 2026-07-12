@@ -145,31 +145,59 @@ class DynamoDBClient:
                 raise EmailAlreadyExists(user_item["email"]) from e
             raise
 
-    def update_user(self, user_id: str, updates: dict, current_email: str, new_email: str | None) -> dict:
+    @staticmethod
+    def _build_update_expression(updates: dict, remove_keys: list[str]) -> tuple[str, dict, dict]:
+        """Builds a combined `SET ... REMOVE ...` expression — used both for
+        the plain-update path and the email-changing transaction below."""
+        set_parts = []
+        expr_names = {}
+        expr_values = {}
+        for i, (k, v) in enumerate(updates.items()):
+            placeholder = f"#f{i}"
+            value_ph = f":v{i}"
+            set_parts.append(f"{placeholder} = {value_ph}")
+            expr_names[placeholder] = k
+            expr_values[value_ph] = v
+
+        remove_parts = []
+        for i, k in enumerate(remove_keys):
+            placeholder = f"#r{i}"
+            remove_parts.append(placeholder)
+            expr_names[placeholder] = k
+
+        expr = "SET " + ", ".join(set_parts)
+        if remove_parts:
+            expr += " REMOVE " + ", ".join(remove_parts)
+
+        return expr, expr_names, expr_values
+
+    def update_user(
+        self,
+        user_id: str,
+        updates: dict,
+        current_email: str,
+        new_email: str | None,
+        remove_keys: list[str] | None = None,
+    ) -> dict:
         """
         Apply a partial update. If the email is changing, this is done as a
         transaction that releases the old email lock and claims the new one
         alongside the attribute update, so a duplicate-email race is still
         caught atomically. If the email isn't changing, it's a plain
-        UpdateItem.
+        UpdateItem. `remove_keys` (e.g. ["address"]) is applied as a REMOVE
+        clause alongside the SET, for attributes being cleared rather than
+        set to a new value — DynamoDB can't store None the way SET expects.
         """
         updates = dict(updates)
         updates["updated_at"] = now_iso()
+        remove_keys = remove_keys or []
 
         if new_email is None or new_email == current_email:
-            update_expr_parts = []
-            expr_names = {}
-            expr_values = {}
-            for i, (k, v) in enumerate(updates.items()):
-                placeholder = f"#f{i}"
-                value_ph = f":v{i}"
-                update_expr_parts.append(f"{placeholder} = {value_ph}")
-                expr_names[placeholder] = k
-                expr_values[value_ph] = v
+            update_expr, expr_names, expr_values = self._build_update_expression(updates, remove_keys)
 
             resp = self.table.update_item(
                 Key={"user_id": user_id},
-                UpdateExpression="SET " + ", ".join(update_expr_parts),
+                UpdateExpression=update_expr,
                 ExpressionAttributeNames=expr_names,
                 ExpressionAttributeValues=expr_values,
                 ConditionExpression="attribute_exists(user_id)",
@@ -182,15 +210,7 @@ class DynamoDBClient:
         new_lock_key = _email_lock_key(new_email)
         updates["email"] = new_email
 
-        update_expr_parts = []
-        expr_names = {}
-        expr_values = {}
-        for i, (k, v) in enumerate(updates.items()):
-            placeholder = f"#f{i}"
-            value_ph = f":v{i}"
-            update_expr_parts.append(f"{placeholder} = {value_ph}")
-            expr_names[placeholder] = k
-            expr_values[value_ph] = v
+        update_expr, expr_names, expr_values = self._build_update_expression(updates, remove_keys)
 
         try:
             self._client.transact_write_items(
@@ -199,7 +219,7 @@ class DynamoDBClient:
                         "Update": {
                             "TableName": self.table_name,
                             "Key": _to_dynamo({"user_id": user_id}),
-                            "UpdateExpression": "SET " + ", ".join(update_expr_parts),
+                            "UpdateExpression": update_expr,
                             "ExpressionAttributeNames": expr_names,
                             "ExpressionAttributeValues": _to_dynamo(expr_values),
                             "ConditionExpression": "attribute_exists(user_id)",
