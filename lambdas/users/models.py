@@ -29,6 +29,15 @@ ALLOWED_STATUSES = {"active", "inactive", "suspended"}
 
 ADDRESS_FIELDS = ("address1", "city", "province", "postal_code", "country")
 
+CANADIAN_PROVINCES = {
+    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT",
+}
+
+# Matches "A1A1A1" or "A1A 1A1" once whitespace is stripped for comparison —
+# see _validate_address, which re-inserts the separating space on the way
+# into storage so every saved postal code has a consistent shape.
+POSTAL_CODE_RE = re.compile(r"^[A-Za-z]\d[A-Za-z]\d[A-Za-z]\d$")
+
 # Mirrors the Cognito User Pool's password policy (chonkychonk-admin). Kept
 # in sync manually — if the pool policy changes, update this too so bad
 # passwords are rejected here instead of round-tripping to Cognito first.
@@ -121,7 +130,28 @@ def _validate_address(value) -> Optional[dict]:
     if not address1:
         raise ValidationError("'address' must include a street address")
 
-    return {field: str(value.get(field, "")).strip() for field in ADDRESS_FIELDS}
+    # Stored as the short code only (e.g. "ON") — the admin/storefront UIs
+    # present a province dropdown, so anything else means a stale client or
+    # a hand-crafted request.
+    province = str(value.get("province", "")).strip().upper()
+    if province and province not in CANADIAN_PROVINCES:
+        raise ValidationError(
+            f"'province' must be one of {', '.join(sorted(CANADIAN_PROVINCES))}"
+        )
+
+    # Accepts "A1A1A1" or "A1A 1A1" (any whitespace, really) but always
+    # saves with the single separating space so downstream consumers (e.g.
+    # shipping labels) don't each have to re-normalize it.
+    postal_code = re.sub(r"\s+", "", str(value.get("postal_code", ""))).upper()
+    if postal_code:
+        if not POSTAL_CODE_RE.match(postal_code):
+            raise ValidationError("'postal_code' must match the Canadian format 'A1A 1A1'")
+        postal_code = f"{postal_code[:3]} {postal_code[3:]}"
+
+    address = {field: str(value.get(field, "")).strip() for field in ADDRESS_FIELDS}
+    address["province"] = province
+    address["postal_code"] = postal_code
+    return address
 
 
 # ---------------------------------------------------------------------------
