@@ -166,20 +166,30 @@ Resources:
   # API Gateway (implicit)  —  auto-created by SAM for all
   # Lambda API events. No explicit stage name = root path.
   # ----------------------------------------------------------
-  ServerlessRestApi:
+  ChonkyRestApi:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Environment
       OpenApiVersion: '3.0.1'
-      # Only used by POST /cart/claim (see OrdersFunction below) — every
-      # other route stays unauthenticated at the API Gateway level, since
-      # the cart routes have to accept both guest and logged-in callers.
-      Auth: !If
-        - HasCustomerCognitoPool
-        - Authorizers:
-            CustomerCognitoAuthorizer:
-              UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CustomerCognitoUserPoolId}"
-        - !Ref AWS::NoValue
+      # Only used by POST /cart/claim + the self-service profile routes
+      # (see GetUserById/PutUser/ClaimCart below) — every other route stays
+      # unauthenticated at the API Gateway level, since the cart routes
+      # have to accept both guest and logged-in callers.
+      #
+      # NOTE: this Authorizers map has to be declared unconditionally —
+      # SAM's Api-resource Auth property doesn't support Fn::If (sam
+      # validate rejects it with "Invalid value for 'Auth' property"; it
+      # was previously wrapped in !If [HasCustomerCognitoPool, ...] and
+      # silently ignored instead of erroring, because this resource used
+      # to be misnamed ServerlessRestApi — SAM's reserved logical ID for
+      # its own auto-generated implicit API — which quietly dropped this
+      # entire Auth property at transform time instead of validating it.
+      # Each route that wants this authorizer still opts in individually
+      # via its own per-event `Auth: !If [HasCustomerCognitoPool, ...]`.
+      Auth:
+        Authorizers:
+          CustomerCognitoAuthorizer:
+            UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CustomerCognitoUserPoolId}"
 
   # ----------------------------------------------------------
   # Shared Layer  —  contains shared/db.py and any other
@@ -218,7 +228,7 @@ Resources:
   # /products and /products/{productid}. DynamoDB, no VPC.
   #
   # Auth is not configured in this template (see the
-  # ServerlessRestApi comment above) — it's attached externally
+  # ChonkyRestApi comment above) — it's attached externally
   # via scripts/attach-cognito-authorizer.sh, which needs an
   # entry for each of CreateProduct/UpdateProduct/PatchProduct/
   # DeleteProduct below, while leaving GetProducts and
@@ -242,49 +252,49 @@ Resources:
         GetProducts:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products
             Method: GET
         GetProductById:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: GET
         CreateProduct:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products
             Method: POST
         UpdateProduct:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: PUT
         PatchProduct:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: PATCH
         DeleteProduct:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: DELETE
         ProductsPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products
             Method: OPTIONS
         ProductByIdPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /products/{productid}
             Method: OPTIONS
 
@@ -398,37 +408,37 @@ Resources:
         PostOrders:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders
             Method: POST
         GetOrder:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders/{orderId}
             Method: GET
         PutOrder:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders/{orderId}
             Method: PUT
         DeleteOrder:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders/{orderId}
             Method: DELETE
         OrdersPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders
             Method: OPTIONS
         OrderByIdPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /orders/{orderId}
             Method: OPTIONS
 
@@ -436,73 +446,77 @@ Resources:
         GetCart:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart
             Method: GET
         CartPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart
             Method: OPTIONS
         AddCartItem:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/items
             Method: POST
         CartItemsPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/items
             Method: OPTIONS
         UpdateCartItem:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/items/{productId}
             Method: PUT
         RemoveCartItem:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/items/{productId}
             Method: DELETE
         CartItemByIdPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/items/{productId}
             Method: OPTIONS
         CheckoutCart:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/{orderId}/checkout
             Method: POST
         CheckoutCartPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/{orderId}/checkout
             Method: OPTIONS
         # The only cart route behind the Cognito authorizer — see the
-        # ServerlessRestApi/HasCustomerCognitoPool comments above.
+        # ChonkyRestApi/HasCustomerCognitoPool comments above.
         ClaimCart:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/claim
             Method: POST
-            Auth: !If
-              - HasCustomerCognitoPool
-              - Authorizer: CustomerCognitoAuthorizer
-              - !Ref AWS::NoValue
+            # NOTE: unconditional, not gated by HasCustomerCognitoPool — SAM's
+            # transform silently drops Fn::If in a per-event Auth property
+            # instead of erroring (confirmed via a throwaway change set), the
+            # same way it silently dropped Fn::If on the API-level Auth
+            # property above. CustomerCognitoUserPoolId is always set in
+            # practice (see deploy-products.sh defaults), so this is safe.
+            Auth:
+              Authorizer: CustomerCognitoAuthorizer
         ClaimCartPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /cart/claim
             Method: OPTIONS
 
@@ -552,13 +566,13 @@ Resources:
         GetUsers:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users
             Method: GET
         # Self-service profile routes — a signed-in shopper viewing/editing
         # their own profile (see Profile.jsx). Behind the same customer
         # Cognito authorizer as POST /cart/claim (HasCustomerCognitoPool
-        # condition on ServerlessRestApi); lambda_handler.py additionally
+        # condition on ChonkyRestApi); lambda_handler.py additionally
         # checks the caller's verified sub matches the {userId} in the
         # path, so nobody can read/edit anyone else's profile just by
         # knowing their id. GetUsers/PostUsers/DeleteUser are unrelated
@@ -566,45 +580,53 @@ Resources:
         GetUserById:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: GET
-            Auth: !If
-              - HasCustomerCognitoPool
-              - Authorizer: CustomerCognitoAuthorizer
-              - !Ref AWS::NoValue
+            # NOTE: unconditional, not gated by HasCustomerCognitoPool — SAM's
+            # transform silently drops Fn::If in a per-event Auth property
+            # instead of erroring (confirmed via a throwaway change set), the
+            # same way it silently dropped Fn::If on the API-level Auth
+            # property above. CustomerCognitoUserPoolId is always set in
+            # practice (see deploy-products.sh defaults), so this is safe.
+            Auth:
+              Authorizer: CustomerCognitoAuthorizer
         PostUsers:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users
             Method: POST
         PutUser:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: PUT
-            Auth: !If
-              - HasCustomerCognitoPool
-              - Authorizer: CustomerCognitoAuthorizer
-              - !Ref AWS::NoValue
+            # NOTE: unconditional, not gated by HasCustomerCognitoPool — SAM's
+            # transform silently drops Fn::If in a per-event Auth property
+            # instead of erroring (confirmed via a throwaway change set), the
+            # same way it silently dropped Fn::If on the API-level Auth
+            # property above. CustomerCognitoUserPoolId is always set in
+            # practice (see deploy-products.sh defaults), so this is safe.
+            Auth:
+              Authorizer: CustomerCognitoAuthorizer
         DeleteUser:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: DELETE
         UsersPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users
             Method: OPTIONS
         UserByIdPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: OPTIONS
 
@@ -644,13 +666,13 @@ Resources:
         PostPayment:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /payments
             Method: POST
         PaymentsPreflight:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /payments
             Method: OPTIONS
 
@@ -695,7 +717,7 @@ Resources:
         StripeWebhook:
           Type: Api
           Properties:
-            RestApiId: !Ref ServerlessRestApi
+            RestApiId: !Ref ChonkyRestApi
             Path:   /webhook
             Method: POST
 
@@ -706,27 +728,27 @@ Resources:
 Outputs:
   ProductsApi:
     Description: Products endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/products"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/products"
 
   UsersApi:
     Description: Users endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/users"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/users"
 
   OrdersApi:
     Description: Orders (one-shot placement) endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/orders"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/orders"
 
   CartApi:
     Description: Cart endpoint (guest or logged-in)
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/cart"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/cart"
 
   PaymentsApi:
     Description: Payments endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/payments"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/payments"
 
   WebhookApi:
     Description: Stripe webhook endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/dev/webhook"
+    Value: !Sub "https://${ChonkyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook"
 
   EventBusArn:
     Description: EventBridge bus ARN
