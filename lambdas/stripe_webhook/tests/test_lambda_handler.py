@@ -14,6 +14,15 @@ def _sign(body: str, secret: str = TEST_WEBHOOK_SECRET) -> str:
     return f"t={timestamp},v1={signature}"
 
 
+def _sign_with_trailing_v0(body: str, secret: str = TEST_WEBHOOK_SECRET) -> str:
+    """
+    Some Stripe API versions include a legacy v0 signature alongside v1 in
+    the same header, e.g. "t=...,v1=...,v0=...". v0 here is deliberately
+    garbage — a correct implementation ignores it entirely.
+    """
+    return _sign(body, secret) + ",v0=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+
 def _webhook_event(event_type: str, order_id: str, intent_id: str = "pi_123", extra: dict | None = None) -> dict:
     obj = {"id": intent_id, "metadata": {"order_id": order_id}, "amount": 2499, "currency": "cad"}
     if extra:
@@ -46,6 +55,22 @@ class TestSignatureVerification:
             {"body": body, "headers": {"stripe-signature": "t=123,v1=deadbeef"}}, None
         )
         assert resp["statusCode"] == 401
+
+    def test_accepts_capitalized_header_name(self, dynamodb_tables, orders_table, monkeypatch):
+        """
+        Stripe sends "Stripe-Signature" (capitalized), and API Gateway's REST
+        API proxy integration preserves that casing verbatim in event
+        ["headers"] rather than lowercasing it — a lowercase-only lookup
+        misses every real webhook. Regression test for that bug.
+        """
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ORDER", "status": "pending"})
+        body = json.dumps(_webhook_event("payment_intent.succeeded", "o1"))
+        resp = lambda_handler.lambda_handler(
+            {"body": body, "headers": {"Stripe-Signature": _sign(body)}}, None
+        )
+        assert resp["statusCode"] == 200
+        assert orders_table.get_item(Key={"order_id": "o1", "sk": "ORDER"})["Item"]["status"] == "completed"
 
 
 class TestPaymentIntentSucceeded:

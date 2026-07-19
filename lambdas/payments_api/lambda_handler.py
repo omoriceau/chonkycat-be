@@ -207,7 +207,11 @@ def lambda_handler(event, context):
         logger.info("retrieving order: order_id=%s", order_id)
         db = get_db_client()
         order = get_order(db, order_id)
-        email = get_user_email(db, order["user_id"])
+        # The order already carries the email it was placed under (see
+        # checkout_cart/create_order in the orders lambda) — prefer that
+        # directly rather than looking up a Users table row, since guest
+        # orders have user_id="guest_<uuid>" with no matching user record.
+        email = order.get("customer_email") or get_user_email(db, order["user_id"])
 
         logger.info("order retrieved: status=%s total_amount=%s", order["status"], order["total_amount"])
 

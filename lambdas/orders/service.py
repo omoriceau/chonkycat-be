@@ -161,6 +161,22 @@ class OrderService:
             },
         }
 
+    def list_my_orders(self, user_id: str) -> list[dict]:
+        """
+        Customer-facing order history (storefront profile page) — every
+        order this user has placed, newest first, with full item/shipping
+        detail (reuses _order_to_response, same shape as get_order()).
+        """
+        order_rows = self._db.list_orders_for_user(user_id)
+
+        orders = []
+        for row in order_rows:
+            result = self._db.get_order_with_children(row["order_id"])
+            if result is None:
+                continue
+            orders.append(self._order_to_response(result["order"], result["items"]))
+        return orders
+
     def delete_order(self, order_id: str) -> bool:
         """
         Soft delete an order by setting a deleted_at timestamp.

@@ -144,6 +144,9 @@ def lambda_handler(event: dict, context) -> dict:
     if resource.startswith("/cart"):
         return _handle_cart_request(event, resource, method)
 
+    if resource == "/users/orders" and method == "GET":
+        return _handle_list_my_orders(event)
+
     has_order_id = bool((event.get("pathParameters") or {}).get("orderId"))
 
     # Route based on HTTP method
@@ -236,6 +239,26 @@ def _handle_list_orders(event: dict) -> dict:
         return ok(result)
     except Exception:
         logger.exception("Error listing orders")
+        return err("Internal server error", status=500)
+
+
+def _handle_list_my_orders(event: dict) -> dict:
+    """
+    GET /users/orders — the caller's own order history. Self-verifying
+    bearer token via identity.py (same mechanism as the /cart routes), not
+    the admin authorizer that gates GET /orders above — a shopper isn't an
+    admin, so this route resolves and scopes to their own sub instead.
+    """
+    try:
+        user_id = resolve_user_id(event)
+    except IdentityError as e:
+        return err(str(e), status=401)
+
+    try:
+        orders = _get_service().list_my_orders(user_id)
+        return ok({"orders": orders})
+    except Exception:
+        logger.exception("Error listing user's orders")
         return err("Internal server error", status=500)
 
 

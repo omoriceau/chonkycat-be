@@ -14,7 +14,7 @@ die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # ==============================================================================
 # Argument parsing
 #
-# Usage: $0 [--environment dev|staging|prod] [--region REGION] [--dev-email EMAIL] [--cors] [--ses-domain DOMAIN]
+# Usage: $0 [--environment dev|staging|prod] [--region REGION] [--dev-email EMAIL] [--ses-domain DOMAIN]
 #
 # All flags are optional and order-independent. Both "--flag value" and
 # "--flag=value" forms are accepted. Run with --help for details.
@@ -30,9 +30,6 @@ Options:
                                              configured default region, falling
                                              back to us-east-1 with a warning)
   --dev-email <email>                       DevEmail parameter (default: dev@example.com)
-  --cors                                    Enable permissive CORS (Access-Control-
-                                             Allow-Origin: *). Only allowed with
-                                             --environment dev.
   --ses-domain <domain>                     Domain to set up in SES for sending
                                              notification emails (creates/verifies
                                              the domain identity + DKIM, plus
@@ -72,7 +69,6 @@ Environment variables (Cognito):
 Examples:
   $0
   $0 --environment staging --region eu-west-1
-  $0 --env dev --cors
   $0 --environment=prod --region=us-east-1 --dev-email=alerts@chonkychonk.com
   $0 --ses-domain chonkycat.ca
   CLOUDFLARE_API_TOKEN=xxx CLOUDFLARE_ZONE_ID=yyy $0 --ses-domain chonkycat.ca
@@ -83,7 +79,6 @@ EOF
 ENVIRONMENT="dev"
 REGION_ARG=""
 DEV_EMAIL="dev@example.com"
-ALLOW_CORS=true
 SES_DOMAIN="${SES_DOMAIN:-}"
 # Defaults match this account's actual pools (see `aws cognito-idp
 # list-user-pools`) — chonkychonk-admin is a long-lived, rarely-changing
@@ -123,10 +118,6 @@ while [[ $# -gt 0 ]]; do
       [ $# -ge 2 ] || die "$1 requires a value."
       DEV_EMAIL="$2"
       shift 2
-      ;;
-    --cors)
-      ALLOW_CORS=true
-      shift
       ;;
     --ses-domain=*)
       SES_DOMAIN="${1#*=}"
@@ -203,15 +194,6 @@ case "$ENVIRONMENT" in
     ;;
 esac
 
-# --cors is deliberately restricted to dev. Permissive CORS (Access-Control-
-# Allow-Origin: *) on a staging/prod API is an easy way to accidentally let
-# any website read authenticated responses cross-origin — if you need CORS
-# open in staging/prod for a real reason, do it explicitly in the template
-# for that environment rather than via this shortcut flag.
-if [ "$ALLOW_CORS" = true ] && [ "$ENVIRONMENT" != "dev" ]; then
-    die "--cors is only allowed with --environment dev (got '$ENVIRONMENT'). Refusing to deploy permissive CORS to staging/prod."
-fi
-
 # If Cloudflare auto-DNS was requested, make sure we can actually do it
 # (needs jq to parse the API responses) before setup_ses gets there.
 CF_AUTO_DNS=false
@@ -224,9 +206,9 @@ if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ZONE_ID:-}" ]; then
 fi
 
 log "Deploying products lambda to $ENVIRONMENT in $REGION"
-if [ "$ALLOW_CORS" = true ]; then
-    warn "Permissive CORS enabled (--cors): Access-Control-Allow-Origin will be '*' for this deploy."
-fi
+# CORS is resolved at request time from the deployed ENVIRONMENT (see
+# shared/cors.py): "dev" echoes back any Origin, everything else only
+# allows https://*.chonkycat.ca — nothing to configure here.
 
 # ==============================================================================
 # DynamoDB tables — all six lambdas are now fully migrated off RDS, so these
@@ -494,14 +476,6 @@ PARAM_OVERRIDES=(
   "ParameterKey=CustomerCognitoUserPoolId,ParameterValue=$CUSTOMER_COGNITO_USER_POOL_ID"
   "ParameterKey=CustomerCognitoAppClientId,ParameterValue=$CUSTOMER_COGNITO_APP_CLIENT_ID"
 )
-
-# --cors: passed through as a parameter override. This assumes
-# template.yaml declares an AllowCorsOrigin parameter and wires it into the
-# API Gateway Cors config / response headers — if it doesn't yet, this
-# override is a no-op and the template needs that parameter added.
-if [ "$ALLOW_CORS" = true ]; then
-  PARAM_OVERRIDES+=("ParameterKey=AllowCorsOrigin,ParameterValue=*")
-fi
 
 sam deploy \
     --template-file .aws-sam/build/template.yaml \
