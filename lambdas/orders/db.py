@@ -150,6 +150,22 @@ class DynamoDBClient:
         items = resp.get("Items", [])
         return items[0] if items else None
 
+    def list_orders_for_user(self, user_id: str) -> list[dict]:
+        """
+        The caller's own order history (storefront profile page) — every
+        placed order, newest first. Same sparse UserOrdersIndex as
+        get_open_cart(), just excluding the open cart itself and any
+        soft-deleted orders instead of selecting for them.
+        """
+        resp = self.orders_table.query(
+            IndexName="UserOrdersIndex",
+            KeyConditionExpression=Key("user_id").eq(user_id),
+            FilterExpression=Attr("status").ne("cart") & Attr("deleted_at").not_exists(),
+        )
+        items = resp.get("Items", [])
+        items.sort(key=lambda o: o.get("created_at") or "", reverse=True)
+        return items
+
     # ------------------------------------------------------------------
     # Cart — writes
     #

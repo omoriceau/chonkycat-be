@@ -28,7 +28,7 @@ Parameters:
   Environment:
     Type:    String
     Default: dev
-    AllowedValues: [dev]
+    AllowedValues: [dev, staging, prod]
 
   EventBusName:
     Type:    String
@@ -489,6 +489,22 @@ Resources:
           Properties:
             RestApiId: !Ref ChonkyRestApi
             Path:   /orders/{orderId}
+            Method: OPTIONS
+
+        # ---- Customer "my orders" (self-verifying bearer token via
+        # identity.py, same as the cart routes below — no admin authorizer
+        # here, unlike GET /orders above) ----
+        GetMyOrders:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /users/orders
+            Method: GET
+        MyOrdersPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /users/orders
             Method: OPTIONS
 
         # ---- Cart (guest or logged-in — see lambda_handler.py/identity.py) ----

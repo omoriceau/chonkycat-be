@@ -83,6 +83,24 @@ def err(message: str, status: int = 400) -> dict:
 # Stripe signature verification
 # ---------------------------------------------------------------------------
 
+def _get_header(event: dict, name: str) -> str | None:
+    """
+    Case-insensitive header lookup — API Gateway's REST API proxy
+    integration preserves the caller's original header casing (unlike HTTP
+    APIs, which lowercase everything), and Stripe sends "Stripe-Signature"
+    capitalized. A plain event["headers"].get("stripe-signature") lookup
+    silently misses it on every request — same problem identity.py's
+    _get_header() already solves for the orders Lambda's Authorization/
+    X-Guest-Id headers.
+    """
+    headers = (event or {}).get("headers") or {}
+    lname = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lname:
+            return value
+    return None
+
+
 def verify_stripe_signature(body: str, signature: str) -> dict:
     """
     Verify the Stripe webhook signature.
@@ -106,8 +124,19 @@ def verify_stripe_signature(body: str, signature: str) -> dict:
     try:
         webhook_secret = get_secret(STRIPE_WEBHOOK_SECRET_NAME)
 
-        # Stripe signature format: t=<timestamp>,v1=<signature>
-        timestamp, received_signature = signature.split(",")[0].split("=")[1], signature.split("v1=")[1]
+        # Stripe signature format: "t=<timestamp>,v1=<signature>" — but
+        # Stripe sometimes also includes a legacy "v0=<signature>" field in
+        # the same header (seen in practice on API version 2026-05-27).
+        # Splitting on the literal substring "v1=" instead of parsing each
+        # comma-separated key=value pair grabs everything after it,
+        # including a trailing ",v0=..." — silently corrupting
+        # received_signature so it can never match, even with the right
+        # secret. Parse it as actual key=value pairs instead.
+        fields = dict(part.split("=", 1) for part in signature.split(","))
+        timestamp = fields.get("t")
+        received_signature = fields.get("v1")
+        if not timestamp or not received_signature:
+            raise ValueError("Malformed Stripe-Signature header")
 
         # Compute expected signature
         signed_content = f"{timestamp}.{body}"
@@ -250,7 +279,7 @@ def lambda_handler(event, context):
 
     # Get raw body and signature
     body = event.get("body", "")
-    signature = event.get("headers", {}).get("stripe-signature")
+    signature = _get_header(event, "stripe-signature")
 
     logger.info("body length=%d signature=%s", len(body) if body else 0, signature[:20] if signature else None)
 
