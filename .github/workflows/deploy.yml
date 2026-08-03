@@ -2,9 +2,9 @@ name: Deploy ChonkyChonk Backend
 
 on:
   push:
-    branches: [main]       # deploys to dev on every push
+    branches: [master]     # deploys to dev (auto) + prod (gated) on every push
   pull_request:
-    branches: [main]       # build + validate only, no deploy
+    branches: [master]     # build + validate only, no deploy
 
 permissions:
   id-token: write          # required for OIDC auth to AWS (no long-lived keys stored)
@@ -28,19 +28,19 @@ jobs:
       - uses: aws-actions/setup-sam@v2
 
       - name: SAM build
-        run: sam build --config-env dev
+        run: sam build
 
       - name: SAM validate
         run: sam validate --lint
 
   # ============================================================
-  # Deploy to dev on every push to main
+  # Deploy to dev on every push to master
   # ============================================================
   deploy-dev:
     name: Deploy → Dev
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     environment: dev
 
     steps:
@@ -60,5 +60,60 @@ jobs:
 
       - name: Deploy
         run: |
-          chmod +x deploy-products.sh
-          ./deploy-products.sh --environment dev --region us-east-1
+          chmod +x ci-deploy.sh
+          ./ci-deploy.sh --environment dev
+
+  # ============================================================
+  # Deploy to prod on every push to master — but only once prod
+  # infra actually exists. As of now it doesn't (no prod Cognito
+  # pools / DynamoDB tables provisioned in AWS yet), so this job
+  # is gated behind the vars.PROD_ENABLED repo variable and no-ops
+  # until that's flipped on:
+  #
+  #   repo Settings → Secrets and variables → Actions → Variables
+  #   → New repository variable → name PROD_ENABLED, value true
+  #
+  # Also gated behind the 'prod' GitHub Environment's
+  # required-reviewer approval. Configure the reviewer(s) once:
+  # repo Settings → Environments → prod → Required reviewers.
+  #
+  # All prod-specific config (table names, Cognito pool IDs, SES
+  # domain, alert email) lives in samconfig.toml's
+  # [prod.deploy.parameters] section, not GitHub secrets — none of
+  # it is actually sensitive, and keeping it in one versioned file
+  # is what makes ci-deploy.sh's checks meaningful. Fill in that
+  # section's TODO-* placeholders before flipping PROD_ENABLED on;
+  # ci-deploy.sh refuses to run while any remain. Only the IAM role
+  # ARN below is a real secret (it gates AWS account access itself).
+  #
+  # ci-deploy.sh also expects the prod DynamoDB tables / S3 bucket /
+  # EventBridge bus to already exist — it only verifies, it never
+  # creates or deletes anything. Run deploy-products.sh manually,
+  # once, to provision a new environment first.
+  # ============================================================
+  deploy-prod:
+    name: Deploy → Prod
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push' && vars.PROD_ENABLED == 'true'
+    environment: prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/setup-sam@v2
+
+      # Authenticate via OIDC — no AWS access keys stored in GitHub secrets
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region:     us-east-1
+
+      - name: Deploy
+        run: |
+          chmod +x ci-deploy.sh
+          ./ci-deploy.sh --environment prod

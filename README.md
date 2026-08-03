@@ -1,252 +1,197 @@
 # ChonkyChonk Backend
 
-AWS Lambda backend for the ChonkyChonk cat food store.
+[![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=omoriceau_chonkycat-be&metric=alert_status&token=7a4ae696822ec0183f38a4eb8401a4e1c0230f54)](https://sonarcloud.io/summary/new_code?id=omoriceau_chonkycat-be)
 
-## AWS Secrets Manager Setup
-
-This application uses AWS Secrets Manager to securely manage sensitive credentials. You must create the following secrets in your AWS account before deploying:
-
-### Required Secrets
-
-Create these secrets in AWS Secrets Manager for each environment (dev, staging, prod):
-
-#### Database Password
-- **Name**: `chonky/{environment}/db_pass`
-- **Value**: Plain text or JSON (e.g., `{"password": "your-db-password"}`)
-- **Used by**: All Lambdas that connect to RDS
-
-#### Stripe Secret Key
-- **Name**: `chonky/{environment}/stripe_secret_key`
-- **Value**: Plain text or JSON (e.g., `{"key": "sk_test_..."}`)
-- **Used by**: stripe_intent, payments_api Lambdas
-
-#### SSH Private Key (EC2 Schema Loader)
-- **Name**: `chonky/{environment}/ssh_private_key`
-- **Value**: Plain text SSH private key content
-- **Used by**: Terraform for EC2 provisioning
-
-### Creating Secrets (AWS CLI)
-
-```bash
-# Set environment
-ENV=dev
-
-# Create DB password secret
-aws secretsmanager create-secret \
-  --name chonky/${ENV}/db_pass \
-  --secret-string "your-postgres-password" \
-  --region ca-central-1
-
-# Create Stripe secret
-aws secretsmanager create-secret \
-  --name chonky/${ENV}/stripe_secret_key \
-  --secret-string "sk_test_51Tj1XX..." \
-  --region ca-central-1
-
-# Create SSH key secret
-aws secretsmanager create-secret \
-  --name chonky/${ENV}/ssh_private_key \
-  --secret-string "$(cat ~/.ssh/chonky.pem)" \
-  --region ca-central-1
-```
-
-### Environment Variables for Local Development
-
-For local development, the code falls back to environment variables if AWS Secrets Manager is not available. Set these in `.env.local`:
-
-```bash
-# Local fallbacks (used if AWS Secrets Manager lookup fails)
-DB_PASSWORD=chonky_password
-STRIPE_SECRET_KEY=sk_test_...
-SSH_PRIVATE_KEY=$(cat ~/.ssh/chonky.pem)
-DEV_EMAIL="<for dev only - needs to be setup in AWS SES>"
-
-# Secret names (can also be overridden)
-DB_PASSWORD_SECRET_NAME=chonky/dev/db_pass
-STRIPE_SECRET_KEY_SECRET_NAME=chonky/dev/stripe_secret_key
-SSH_PRIVATE_KEY_SECRET_NAME=chonky/dev/ssh_private_key
-```
-
-### Terraform Integration (EC2 Schema Loader)
-
-The EC2 schema loader retrieves the SSH private key from Secrets Manager:
-
-```bash
-export TF_VAR_ssh_key_secret_name="chonky/dev/ssh_private_key"
-export TF_VAR_key_name="chonky"
-export TF_VAR_allowed_ssh_cidr="$(curl -s https://checkip.amazonaws.com)/32"
-terraform apply -backend-config=backend/dev.hcl
-```
+AWS Lambda backend for the ChonkyChonk cat food store — an AWS SAM stack
+(API Gateway + Lambda + DynamoDB + Cognito + EventBridge + SES + Stripe),
+deployed to `us-east-1`.
 
 ## Structure
 
-
 ```
-chonkychonk-backend/
-├── shared/
-│   └── events.py                   # Canonical EventBridge event definitions (single source of truth)
+chonky-cat-be/
+├── template.yaml            # SAM template — the source of truth for every AWS resource
+├── samconfig.toml           # Per-environment deploy config (stack name, region, parameters)
+├── ci-deploy.sh             # What CI runs: verify infra exists, sam build, sam deploy
+├── deploy-products.sh       # Manual, interactive: provisions a new environment's infra
 │
-├── db/
-│   └── migration_websocket.sql     # Adds ws_connections table + orders.connection_id
+├── shared/python/shared/    # Lambda layer — imported as `from shared.x import y`
+│   ├── db.py                 # DynamoDB table helpers
+│   ├── cors.py                # CORS headers (dev echoes any Origin; other envs allow *.chonkycat.ca)
+│   ├── secrets.py             # Secrets Manager lookups
+│   └── events.py              # EventBridge source/detail-type constants + payload shapes
 │
 └── lambdas/
-    ├── products/
-    │   └── lambda_handler.py       # GET /products
-    │
-    ├── users/
-    │   └── lambda_handler.py       # GET /users/{id}  + UserRegistered emit helper
-    │
-    ├── orders/
-    │   ├── lambda_handler.py       # POST /orders
-    │   ├── models.py               # Request dataclasses + validation
-    │   └── service.py              # DB writes, OrderCreated emit, LowStockDetected emit
-    │
-    ├── payments/
-    │   ├── lambda_handler.py       # EventBridge target — charge/refund, WS notify, event emit, SNS alert
-    │   ├── models.py               # Charge/refund payload models
-    │   ├── service.py              # PaymentService — provider orchestration + DB writes
-    │   └── providers/
-    │       ├── base.py             # PaymentProvider ABC + value objects
-    │       ├── stripe_provider.py  # Stripe implementation
-    │       └── factory.py          # Payment provider registry
-    │
-    ├── email/
-    │   ├── lambda_handler.py       # Email router — handles all 7 event types
-    │   ├── providers/
-    │   │   ├── base.py             # EmailProvider ABC + all context dataclasses
-    │   │   ├── ses_provider.py     # AWS SES implementation
-    │   │   └── factory.py          # Email provider registry
-    │   └── templates/
-    │       └── renderer.py         # Pure render functions → (subject, html, text)
-    │
-    └── websocket/
-        └── lambda_handler.py       # $connect / $disconnect / notify routes
+    ├── products/             # Product catalog CRUD + image upload
+    ├── orders/                # Cart + order placement
+    ├── users/                 # User CRUD, Cognito account management, self-service profile
+    ├── payments_api/          # POST /payments — creates the Stripe PaymentIntent
+    ├── stripe_intent/         # Calls the Stripe API (invoked by payments_api, not API Gateway)
+    ├── stripe_webhook/        # Receives Stripe webhook events, updates order/payment status
+    └── email_service/         # Sends transactional email in response to EventBridge events
+        └── email_service/     # Provider abstraction (base.py, factory.py, ses_provider.py)
 ```
+
+Each `lambdas/<name>/` directory is its own independently deployable
+package with its own `requirements.txt`, `pytest.ini`, and `tests/`.
+
+## API
+
+All routes are on one API Gateway REST API, one stage per environment
+(`/dev`, `/prod`, …).
+
+| Method | Path | Lambda | Notes |
+|--------|------|--------|-------|
+| GET | `/products` | products | Public |
+| GET | `/products/{productid}` | products | Public |
+| POST / PUT / PATCH / DELETE | `/products[/{productid}]` | products | Admin |
+| POST | `/products/{productid}/image` | products | Admin — uploads to `chonky-images-<env>` |
+| POST | `/products/image` | products | Admin — upload by SKU |
+| GET / POST | `/orders` | orders | Admin |
+| GET / PUT / DELETE | `/orders/{orderId}` | orders | Admin |
+| GET | `/users/orders` | orders | Customer self-service (bearer token) |
+| GET / POST | `/cart`, `/cart/items` | orders | Guest or logged-in |
+| PUT / DELETE | `/cart/items/{productId}` | orders | Guest or logged-in |
+| POST | `/cart/{orderId}/checkout` | orders | Guest or logged-in |
+| POST | `/cart/claim` | orders | Requires customer Cognito auth |
+| GET / POST / DELETE | `/users`, `/users/{userId}` | users | Admin |
+| GET / PUT | `/users/{userId}` | users | Customer self-service — caller must own the `{userId}` |
+| GET / PUT | `/admin/users/{userId}` | users | Admin equivalent of the self-service routes |
+| POST | `/payments` | payments_api | Creates an order's Stripe PaymentIntent |
+| POST | `/webhook` | stripe_webhook | Stripe calls this directly (signature-verified, not Cognito) |
+
+Two Cognito user pools are involved: an admin pool (`CognitoUserPoolId`,
+used by `users` for account management via `AdminCreateUser` etc.) and a
+customer-facing pool (`CustomerCognitoUserPoolId`, used as an API Gateway
+authorizer on the self-service/cart-claim routes above). Admin-route
+authorization is attached outside this template.
 
 ## Event flow
 
+`orders` and `users` publish onto the `chonkychonk-bus` EventBridge bus;
+`email_service` is the only current subscriber:
+
 ```
-Frontend
-  │
-  ├─ Opens WebSocket → receives connection_id
-  └─ POST /orders (includes connection_id)
-          │
-          ▼
-    Orders Lambda
-      ├─ validates, prices, persists order
-      ├─ emits OrderCreated       ──────────────────────────► Payment Lambda
-      └─ emits LowStockDetected (if any item crossed threshold) ─► Email Lambda
-                                                                      │
-                                                      sends low stock alert to ops
-    Payment Lambda
-      ├─ charges Stripe
-      ├─ persists payment to Aurora
-      ├─ pushes result to frontend via WebSocket
-      ├─ emits PaymentSettled / PaymentFailed ──────────────► Email Lambda
-      └─ on provider unreachable: publishes to SNS ─────────► Ops team email/SMS
-                                                            Email Lambda
-                                                              ├─ PaymentSettled  → order confirmation
-                                                              ├─ PaymentFailed   → failure email
-                                                              ├─ RefundComplete  → refund confirmation
-                                                              ├─ LowStockDetected→ ops stock alert
-                                                              ├─ UserRegistered  → welcome email
-                                                              ├─ PasswordResetRequest → reset link (Cognito stub)
-                                                              └─ OrderSummaryRequest  → order history
+orders   ──OrderCreated──────►  chonkychonk-bus  ──►  email_service  ──►  order confirmation email
+orders   ──LowStockDetected──►  chonkychonk-bus  ──►  email_service  ──►  (low-stock branch)
+users    ──UserCreated───────►  chonkychonk-bus  ──►  email_service  ──►  welcome email
 ```
 
-## EventBridge rules needed
+`payments_api` and `stripe_webhook` also publish events onto the same bus
+(`PaymentIntentCreated`, `PaymentSucceeded`, `PaymentFailed`) — nothing
+currently subscribes to those; they're available for a future consumer.
 
-| Rule name                  | Source                  | Detail-type             | Target           |
-|----------------------------|-------------------------|-------------------------|------------------|
-| route-order-to-payment     | chonkychonk.orders      | OrderCreated            | Payment Lambda   |
-| route-events-to-email      | chonkychonk.orders      | LowStockDetected        | Email Lambda     |
-|                            | chonkychonk.payments    | PaymentSettled          | Email Lambda     |
-|                            | chonkychonk.payments    | PaymentFailed           | Email Lambda     |
-|                            | chonkychonk.payments    | RefundComplete          | Email Lambda     |
-|                            | chonkychonk.users       | UserRegistered          | Email Lambda     |
-|                            | chonkychonk.users       | PasswordResetRequest    | Email Lambda     |
-|                            | chonkychonk.users       | OrderSummaryRequest     | Email Lambda     |
+The bus itself (`chonkychonk-bus`) is created outside CloudFormation, by
+`deploy-products.sh`, before the stack is deployed — `ci-deploy.sh`
+verifies it exists rather than declaring it as a stack resource.
 
-The `route-events-to-email` rule can use a single pattern with multiple sources/detail-types.
+### EventBridge rule
 
-## SNS topic
-
-`chonkychonk-ops-alerts` — subscribe your ops email address to this topic.
-Receives `PaymentUnreachable` alerts when the payment provider cannot be reached
-(infrastructure failure, not card declines — those go through the Email Lambda).
-
-## Lambda configuration
-
-| Lambda     | Handler                              | Trigger                        |
-|------------|--------------------------------------|-------------------------------|
-| products   | `lambda_handler.lambda_handler`      | API GW GET /products           |
-| users      | `lambda_handler.lambda_handler`      | API GW GET /users/{id}         |
-| orders     | `lambda_handler.lambda_handler`      | API GW POST /orders            |
-| payments   | `payments.lambda_handler.lambda_handler` | EventBridge OrderCreated   |
-| email      | `email.lambda_handler.lambda_handler`| EventBridge (multiple rules)   |
-| websocket  | `lambda_handler.lambda_handler`      | API GW WebSocket               |
+| Source | Detail-type | Target |
+|--------|-------------|--------|
+| `chonkychonk.orders` | `OrderCreated`, `OrderFailure`, `LowStockDetected` | email_service |
+| `chonkychonk.users` | `UserCreated` | email_service |
 
 ## Environment variables
 
-### All Lambdas
-| Variable           | Description             |
-|--------------------|-------------------------|
-| `DB_CLUSTER_ARN`   | Aurora cluster ARN      |
-| `DB_SECRET_ARN`    | Secrets Manager ARN     |
-| `DB_NAME`          | `chonkychonk`           |
-| `EVENT_BUS_NAME`   | default: chonkychonk-bus|
+Set on every Lambda via `template.yaml`'s `Globals`:
 
-### Payments Lambda
-| Variable              | Description                                    |
-|-----------------------|------------------------------------------------|
-| `PAYMENT_PROVIDER`    | default: `stripe`                              |
-| `STRIPE_SECRET_KEY`   | Stripe live or test secret key                 |
-| `APIGW_WS_ENDPOINT`   | API GW WebSocket management endpoint           |
-| `SNS_OPS_TOPIC_ARN`   | SNS topic for payment-unreachable alerts       |
+| Variable | Description |
+|----------|-------------|
+| `EVENT_BUS_NAME` | `chonkychonk-bus` |
+| `STRIPE_SECRET_KEY_SECRET_NAME` | Secrets Manager name for the Stripe secret key |
+| `STRIPE_WEBHOOK_SECRET_NAME` | Secrets Manager name for the Stripe webhook signing secret |
+| `ENVIRONMENT` | `dev` / `staging` / `prod` |
+| `DEV_EMAIL` | Recipient for SES sandbox-mode test sends |
 
-### Email Lambda
-| Variable              | Description                                    |
-|-----------------------|------------------------------------------------|
-| `EMAIL_PROVIDER`      | default: `ses`                                 |
-| `EMAIL_FROM_ADDRESS`  | Verified SES sender address                    |
-| `EMAIL_FROM_NAME`     | Display name (default: ChonkyChonk)            |
-| `SUPPORT_EMAIL`       | Shown in customer-facing templates             |
-| `LOW_STOCK_RECIPIENT` | Internal email for stock alerts                |
+Per-function additions:
 
-### Users Lambda
-| Variable                 | Description                          |
-|--------------------------|--------------------------------------|
-| `COGNITO_ENABLED`        | `true` once Cognito is configured    |
-| `COGNITO_USER_POOL_ID`   | Required when COGNITO_ENABLED=true   |
-| `COGNITO_APP_CLIENT_ID`  | Required when COGNITO_ENABLED=true   |
-
-### WebSocket Lambda
-| Variable          | Description                                |
-|-------------------|--------------------------------------------|
-| `APIGW_ENDPOINT`  | API GW WebSocket management endpoint       |
+| Lambda | Variable | Description |
+|--------|----------|-------------|
+| products | `PRODUCTS_TABLE_NAME`, `PRODUCT_IMAGES_BUCKET` | DynamoDB table; S3 bucket for product images |
+| orders | `ORDERS_TABLE_NAME`, `PRODUCTS_TABLE_NAME`, `PROMOTIONS_TABLE_NAME`, `CUSTOMER_COGNITO_USER_POOL_ID`, `CUSTOMER_COGNITO_APP_CLIENT_ID` | Tables read/written; customer pool for bearer-token verification |
+| users | `USERS_TABLE_NAME`, `COGNITO_USER_POOL_ID` | Table; admin pool for account management |
+| payments_api | `STRIPE_INTENT_FUNCTION_ARN`, `PAYMENTS_TABLE_NAME`, `ORDERS_TABLE_NAME`, `USERS_TABLE_NAME` | Invokes stripe_intent directly; reads/writes these tables |
+| stripe_webhook | `PAYMENTS_TABLE_NAME`, `ORDERS_TABLE_NAME` | Updates payment/order status |
+| email_service | `EMAIL_FROM_ADDRESS` | `no-reply@<SES domain>`, set once SES is provisioned; falls back to a hardcoded default until then |
 
 ## IAM permissions
 
-| Lambda     | Permissions                                                                          |
-|------------|--------------------------------------------------------------------------------------|
-| products   | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue`                         |
-| users      | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue`, `events:PutEvents`     |
-| orders     | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue`, `events:PutEvents`     |
-| payments   | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue`, `events:PutEvents`, `execute-api:ManageConnections`, `sns:Publish` |
-| email      | `ses:SendEmail` on verified domain only — **no DB, no Stripe, no API GW**            |
-| websocket  | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue`, `execute-api:ManageConnections` |
+| Lambda | Permissions |
+|--------|-------------|
+| products | DynamoDB CRUD on the products table; `s3:PutObject` on `chonky-images-<env>/img/*` |
+| orders | DynamoDB CRUD on orders + products, read on promotions, `TransactWriteItems` on orders + products, `events:PutEvents` |
+| users | DynamoDB CRUD on users, `TransactWriteItems` on users, `events:PutEvents`, Cognito `AdminCreateUser`/`AdminSetUserPassword`/`AdminDeleteUser`/`AdminUpdateUserAttributes` scoped to the admin pool |
+| payments_api | DynamoDB CRUD on payments, read on orders + users, `events:PutEvents`, `lambda:InvokeFunction` on stripe_intent |
+| stripe_intent | `secretsmanager:GetSecretValue` on the Stripe secret key |
+| stripe_webhook | `secretsmanager:GetSecretValue` on the webhook secret, DynamoDB CRUD on payments + orders, `events:PutEvents` |
+| email_service | `ses:SendEmail`, `ses:SendRawEmail` — no DynamoDB, no Stripe access |
+
+## Secrets
+
+Two Secrets Manager secrets per environment, named `chonky/<environment>/*`:
+
+| Secret | Used by |
+|--------|---------|
+| `chonky/<env>/stripe_secret_key` | stripe_intent |
+| `chonky/<env>/stripe_webhook_secret` | stripe_webhook |
+
+Create them with:
+
+```bash
+aws secretsmanager create-secret \
+  --name chonky/dev/stripe_secret_key \
+  --secret-string "sk_test_..." \
+  --region us-east-1
+
+aws secretsmanager create-secret \
+  --name chonky/dev/stripe_webhook_secret \
+  --secret-string "whsec_..." \
+  --region us-east-1
+```
 
 ## Adding a new email type
 
-1. Add a constant to `shared/events.py`
-2. Add a context dataclass to `email/providers/base.py`
-3. Add a render function to `email/templates/renderer.py`
-4. Add the method to `EmailProvider` ABC and `SESEmailProvider`
-5. Add a handler + route entry in `email/lambda_handler.py`
-6. Add an EventBridge rule pointing at the Email Lambda
+1. Add a dataclass for the email's context to `lambdas/email_service/email_service/base.py`
+2. Add the corresponding abstract method to `EmailProvider` in the same file
+3. Implement it in `lambdas/email_service/email_service/ses_provider.py`
+4. Add a handler branch in `lambdas/email_service/lambda_handler.py` for the new `detail-type`
+5. If the event isn't already covered, add its `detail-type` to `EmailServiceFunction`'s
+   `OrderEmailEvent` pattern in `template.yaml`
 
-## Adding a new payment provider
+## CI/CD
 
-1. Create `lambdas/payments/providers/yourprovider_provider.py` implementing `PaymentProvider`
-2. Add one line to `lambdas/payments/providers/factory.py`
-3. Set `PAYMENT_PROVIDER=yourprovider` on the Payments Lambda
+GitHub Actions (`.github/workflows/`) builds every PR against `master`,
+then on push to `master` deploys dev automatically and prod behind a
+manual approval gate. A SonarQube scan runs on the same triggers. Full
+setup walkthrough (IAM roles, environment config) is in
+[CICD.md](CICD.md) — quick reference below.
+
+### Required GitHub secrets
+
+Nothing deploys until these are set — there are no defaults for AWS
+credentials.
+
+**Repo secrets** (Settings → Secrets and variables → Actions):
+
+| Secret | Required | Used by |
+|--------|----------|---------|
+| `AWS_DEPLOY_ROLE_ARN` | Yes | `deploy-dev` job |
+| `SONAR_TOKEN` | No — scan skips with a warning if unset | SonarQube workflow |
+| `SONAR_HOST_URL` | No — only for a self-hosted SonarQube Server | SonarQube workflow |
+
+**`prod` Environment secret** (Settings → Environments → `prod` → Secrets
+— this is also where you configure the required-reviewer approval that
+gates prod deploys):
+
+| Secret | Required | Used by |
+|--------|----------|---------|
+| `AWS_DEPLOY_ROLE_ARN_PROD` | Yes | `deploy-prod` job |
+
+That's the only prod secret — table names, Cognito pool IDs, SES domain,
+and alert email all live in `samconfig.toml`'s `[prod.deploy.parameters]`
+section instead (none of them are actually sensitive). `ci-deploy.sh`
+refuses to deploy an environment whose config still has a `TODO-*`
+placeholder. Get the two role ARNs by running `./setup-github-actions-oidc.sh`
+(dev) and `./setup-github-actions-oidc.sh --environment prod` — see
+[CICD.md](CICD.md) for the full command list.
