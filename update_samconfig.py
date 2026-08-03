@@ -13,9 +13,25 @@ import re
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
 TOP_LEVEL_STR_KEYS = {"stack_name", "region", "s3_bucket", "capabilities"}
 TOP_LEVEL_BOOL_KEYS = {"confirm_changeset", "resolve_s3"}
+
+
+def resolve_config_path(raw_path: str) -> Path:
+    """
+    Resolve and sanity-check the samconfig.toml path before any file
+    access. This script takes its path from argv, so a caller running it
+    directly with a bad/adversarial argument shouldn't be able to make it
+    read or write an arbitrary file on the system.
+    """
+    path = Path(raw_path).resolve()
+    if path.name != "samconfig.toml":
+        sys.exit(f"Refusing to operate on '{path}' — expected a file named samconfig.toml.")
+    if not path.is_file():
+        sys.exit(f"{path} does not exist or is not a file.")
+    return path
 
 
 def warn(msg):
@@ -83,7 +99,7 @@ def discover_cognito_values(environment: str, region: str) -> dict:
     return discovered
 
 
-def apply_updates(config_file: str, environment: str, updates: dict, dry_run: bool):
+def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: bool):
     """Apply updates to samconfig.toml, editing only the matched lines."""
     with open(config_file) as f:
         lines = f.readlines()
@@ -183,8 +199,9 @@ def apply_updates(config_file: str, environment: str, updates: dict, dry_run: bo
 
 
 def main():
-    config_file, environment, region_arg, dry_run = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+    environment, region_arg, dry_run = sys.argv[2], sys.argv[3], sys.argv[4] == "true"
     cli_overrides = dict(u.split("=", 1) for u in sys.argv[5:])
+    config_file = resolve_config_path(sys.argv[1])
 
     with open(config_file, "rb") as f:
         cfg = tomllib.load(f)
