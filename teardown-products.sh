@@ -105,5 +105,3 @@ fi
 
 log ""
 log "====== TEARDOWN COMPLETE ======"
-log "Note: RDS instance and VPC resources remain for reuse with other deployments."
-log "If you want to remove them, use the aws-setup.sh teardown commands or AWS Console."
