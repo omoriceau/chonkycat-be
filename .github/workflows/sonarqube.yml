@@ -1,0 +1,39 @@
+name: SonarQube
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read   # lets the scan decorate PRs with issues found
+
+jobs:
+  sonarqube:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0   # SonarQube needs full history for blame/new-code analysis
+
+      - name: Check SONAR_TOKEN is configured
+        id: check-token
+        run: |
+          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
+            echo "::warning::SONAR_TOKEN secret is not set — skipping SonarQube scan. See CICD.md to configure sonar-project.properties + the secret."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SonarQube Scan
+        if: steps.check-token.outputs.skip == 'false'
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # Only needed for a self-hosted SonarQube server. Leave unset to
+          # use SonarCloud (sonarcloud.io) instead.
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

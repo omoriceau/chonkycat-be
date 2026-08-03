@@ -1,0 +1,79 @@
+name: Security Scan (Trivy)
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # --- Infrastructure-as-code scan: Terraform under modules/, deployments/, bootstrap/ ---
+      - name: Trivy IaC scan (Terraform)
+        id: trivy-config
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+        continue-on-error: true
+
+      - name: Trivy IaC scan (SARIF report, archived)
+        if: always()
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      # --- Dependency scan: requirements.txt used by dynamodb_loader, dev_image_loader, etc. ---
+      - name: Trivy dependency scan
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+        continue-on-error: true
+
+      - name: Trivy dependency scan (SARIF report, archived)
+        if: always()
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      - name: Archive SARIF reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: trivy-sarif-reports
+          path: |
+            trivy-config.sarif
+            trivy-fs.sarif
+          retention-days: 30
+
+      - name: Fail job if Trivy found CRITICAL/HIGH issues
+        if: steps.trivy-config.outcome == 'failure' || steps.trivy-fs.outcome == 'failure'
+        run: |
+          echo "Trivy found CRITICAL or HIGH severity issues. See the 'Trivy IaC scan' / 'Trivy dependency scan' step logs above for details."
+          exit 1
