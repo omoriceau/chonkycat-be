@@ -12,6 +12,7 @@ import base64
 import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from urllib.parse import parse_qsl
 
 from shared.cors import build_cors_headers
 
@@ -101,6 +102,17 @@ def parse_body(event: dict) -> dict:
     if event.get("isBase64Encoded"):
         raw = base64.b64decode(raw).decode("utf-8")
     return json.loads(raw)
+
+
+def parse_form_body(event: dict) -> dict:
+    """Parse an application/x-www-form-urlencoded body into a flat dict.
+    Used by the inventory-check endpoint, whose frontend submits an actual
+    HTML form rather than JSON: each field name is a SKU, and its value is
+    the quantity being requested for that SKU."""
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        raw = base64.b64decode(raw).decode("utf-8")
+    return dict(parse_qsl(raw, keep_blank_values=True))
 
 
 def get_http_method(event: dict) -> str:

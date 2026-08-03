@@ -36,8 +36,18 @@ None of that runs in CI; `deploy-products.sh` is a manual, one-off tool,
 not something to automate.
 
 `.github/workflows/sonarqube.yml` runs a SonarCloud scan on the same
-triggers. It's static analysis only — no coverage report, since none of
-the Lambda projects currently generate one.
+triggers. Before scanning, it loops over `lambdas/*/` and, for any lambda
+with a `requirements-dev.txt` (currently just `products`), installs that
+lambda's dev deps into a throwaway venv and runs its `tests/` with
+`pytest-cov`, writing `lambdas/<name>/coverage.xml`. Each lambda's suite
+runs as its own subprocess — running two lambdas' `tests/` packages in one
+`pytest` process collides on the `tests.conftest` module name — and from
+the repo root, not `cd`'d into the lambda dir, since `python -m pytest`
+needs the repo root on `sys.path` for `shared` imports to resolve.
+`sonar-project.properties`' `sonar.python.coverage.reportPaths` picks up
+`lambdas/*/coverage.xml` via wildcard, so a lambda gets coverage the moment
+it gains a `requirements-dev.txt` — no other wiring needed. Lambdas without
+one are still scanned statically but show no coverage numbers.
 
 ## Setup
 

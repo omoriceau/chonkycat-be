@@ -89,6 +89,22 @@ class TestRouting:
         )
         assert resp["statusCode"] == 200
 
+    def test_post_inventory_check_routes_to_check_inventory(self, dynamodb_table, make_event):
+        import lambda_handler
+        body_of(lambda_handler.lambda_handler(
+            make_event("POST", body={"sku": "RT-8", "name": "X", "current_stock": 10}), None
+        ))
+
+        event = {
+            "httpMethod": "POST",
+            "resource": "/products/inventory-check",
+            "path": "/products/inventory-check",
+            "body": "RT-8=1",
+        }
+        resp = lambda_handler.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        assert body_of(resp)["data"] == []
+
     def test_missing_table_env_var_returns_500(self, monkeypatch, make_event):
         import importlib
         import lambda_handler
