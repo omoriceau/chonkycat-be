@@ -43,7 +43,7 @@ declare -a UPDATES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --region=*)  REGION_ARG="${1#*=}"; shift ;;
-    --region)    [ $# -ge 2 ] || die "$1 requires a value."; REGION_ARG="$2"; shift 2 ;;
+    --region)    [[ $# -ge 2 ]] || die "$1 requires a value."; REGION_ARG="$2"; shift 2 ;;
     --dry-run)   DRY_RUN=true; shift ;;
     -h|--help)
       echo "Usage: $0 [--dry-run] [--region REGION] <environment> [KEY=VALUE ...]"
@@ -54,15 +54,15 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      [ -z "$ENVIRONMENT" ] || die "Unexpected argument: '$1' (environment already set to '$ENVIRONMENT')."
+      [[ -z "$ENVIRONMENT" ]] || die "Unexpected argument: '$1' (environment already set to '$ENVIRONMENT')."
       ENVIRONMENT="$1"
       shift
       ;;
   esac
 done
 
-[ -n "$ENVIRONMENT" ] || die "Usage: $0 [--dry-run] [--region REGION] <environment> [KEY=VALUE ...]"
-[ -f "$CONFIG_FILE" ] || die "samconfig.toml not found at $CONFIG_FILE."
+[[ -n "$ENVIRONMENT" ]] || die "Usage: $0 [--dry-run] [--region REGION] <environment> [KEY=VALUE ...]"
+[[ -f "$CONFIG_FILE" ]] || die "samconfig.toml not found at $CONFIG_FILE."
 command -v aws >/dev/null 2>&1 || die "aws CLI not found on PATH."
 
 python3 "$SCRIPT_DIR/update_samconfig.py" "$CONFIG_FILE" "$ENVIRONMENT" "$REGION_ARG" "$DRY_RUN" "${UPDATES[@]}"

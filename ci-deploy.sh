@@ -42,9 +42,9 @@ REGION_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --environment=*|--env=*) ENVIRONMENT="${1#*=}"; shift ;;
-    --environment|--env)     [ $# -ge 2 ] || die "$1 requires a value."; ENVIRONMENT="$2"; shift 2 ;;
+    --environment|--env)     [[ $# -ge 2 ]] || die "$1 requires a value."; ENVIRONMENT="$2"; shift 2 ;;
     --region=*)               REGION_ARG="${1#*=}"; shift ;;
-    --region)                 [ $# -ge 2 ] || die "$1 requires a value."; REGION_ARG="$2"; shift 2 ;;
+    --region)                 [[ $# -ge 2 ]] || die "$1 requires a value."; REGION_ARG="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [--environment dev|staging|prod] [--region REGION]"
       exit 0
@@ -58,7 +58,7 @@ case "$ENVIRONMENT" in
   *) die "Invalid environment: '$ENVIRONMENT'. Must be dev, staging, or prod." ;;
 esac
 
-[ -f "$CONFIG_FILE" ] || die "samconfig.toml not found at $CONFIG_FILE."
+[[ -f "$CONFIG_FILE" ]] || die "samconfig.toml not found at $CONFIG_FILE."
 
 # ==============================================================================
 # Pull this environment's config out of samconfig.toml — stack_name, region,
@@ -98,10 +98,10 @@ PYEOF
 )
 
 CONFIG_ERROR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('error',''))" "$CONFIG_JSON")
-[ -z "$CONFIG_ERROR" ] || die "$CONFIG_ERROR Add one (see the [dev...] section for the shape) before deploying $ENVIRONMENT."
+[[ -z "$CONFIG_ERROR" ]] || die "$CONFIG_ERROR Add one (see the [dev...] section for the shape) before deploying $ENVIRONMENT."
 
 TODO_PLACEHOLDERS=$(python3 -c "import json,sys; print(' '.join(json.loads(sys.argv[1])['todo_placeholders']))" "$CONFIG_JSON")
-if [ -n "$TODO_PLACEHOLDERS" ]; then
+if [[ -n "$TODO_PLACEHOLDERS" ]]; then
   die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] still has TODO-* placeholder values for: $TODO_PLACEHOLDERS. Fill in the real values before deploying $ENVIRONMENT."
 fi
 
@@ -110,13 +110,13 @@ CONFIG_REGION=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['regi
 S3_BUCKET=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['s3_bucket'])" "$CONFIG_JSON")
 EVENT_BUS_NAME=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['event_bus_name'])" "$CONFIG_JSON")
 
-[ -n "$STACK_NAME" ] || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing stack_name."
-[ -n "$S3_BUCKET" ]  || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing s3_bucket."
+[[ -n "$STACK_NAME" ]] || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing stack_name."
+[[ -n "$S3_BUCKET" ]]  || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing s3_bucket."
 
 REGION="${REGION_ARG:-$CONFIG_REGION}"
-if [ -z "$REGION" ]; then
+if [[ -z "$REGION" ]]; then
   REGION="$(aws configure get region || true)"
-  if [ -z "$REGION" ]; then
+  if [[ -z "$REGION" ]]; then
     REGION="us-east-1"
     warn "No region in samconfig.toml, no --region passed, and no AWS CLI default region configured — falling back to us-east-1."
   fi
@@ -134,7 +134,7 @@ log "Deploying $STACK_NAME ($ENVIRONMENT) to $REGION"
 log "Verifying DynamoDB tables exist in $REGION..."
 for KEY in UsersTableName ProductsTableName OrdersTableName PaymentsTableName PromotionsTableName; do
   TABLE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['tables'][sys.argv[2]])" "$CONFIG_JSON" "$KEY")
-  [ -n "$TABLE" ] || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing $KEY in parameter_overrides."
+  [[ -n "$TABLE" ]] || die "samconfig.toml's [$ENVIRONMENT.deploy.parameters] is missing $KEY in parameter_overrides."
   aws dynamodb describe-table --table-name "$TABLE" --region "$REGION" >/dev/null 2>&1 \
       || die "DynamoDB table '$TABLE' not found in $REGION. Provision $ENVIRONMENT's infra first (see deploy-products.sh / CICD.md)."
   log "  found: $TABLE"

@@ -99,37 +99,37 @@ def discover_cognito_values(environment: str, region: str) -> dict:
     return discovered
 
 
-def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: bool):
-    """Apply updates to samconfig.toml, editing only the matched lines."""
-    with open(config_file) as f:
-        lines = f.readlines()
-
+def find_section_bounds(lines: list[str], environment: str) -> tuple[int, int]:
+    """Locate the [<environment>.deploy.parameters] section's line range."""
     header_re = re.compile(rf'^\[{re.escape(environment)}\.deploy\.parameters\]\s*$')
     section_start = next((i for i, l in enumerate(lines) if header_re.match(l.strip())), None)
     if section_start is None:
-        sys.exit(f"No [{environment}.deploy.parameters] section found in {config_file}.")
+        sys.exit(f"No [{environment}.deploy.parameters] section found in samconfig.toml.")
 
     section_end = len(lines)
     for i in range(section_start + 1, len(lines)):
         if re.match(r'^\[.*\]\s*$', lines[i].strip()):
             section_end = i
             break
+    return section_start, section_end
 
-    po_start = po_end = None
+
+def find_parameter_overrides_bounds(lines: list[str], section_start: int, section_end: int):
+    """Locate the parameter_overrides = [ ... ] list's line range within a section, if present."""
     for i in range(section_start, section_end):
         if lines[i].strip().startswith("parameter_overrides"):
-            po_start = i
             for j in range(i, section_end):
                 if lines[j].rstrip().endswith("]"):
-                    po_end = j
-                    break
-            break
+                    return i, j
+            return i, None
+    return None, None
 
-    remaining = dict(updates)
-    changes = []  # (key, old, new)
 
+def update_top_level_keys(lines: list[str], section_start: int, section_end: int, remaining: dict) -> list:
+    """Update stack_name/region/s3_bucket/etc. lines in place. Pops handled keys out of `remaining`."""
+    changes = []
     for i in range(section_start, section_end):
-        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', lines[i].strip())
+        m = re.match(r'^([A-Za-z_]\w*)\s*=(.*)$', lines[i].strip())
         if not m:
             continue
         key, old_raw = m.groups()
@@ -145,34 +145,47 @@ def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: b
         else:
             lines[i] = f'{indent}{key.ljust(18)}= "{esc(value)}"\n'
         changes.append((key, old_raw.strip().strip('"'), value))
+    return changes
 
-    if remaining and po_start is not None:
-        for i in range(po_start, po_end + 1):
-            m = re.match(r'^(\s*)"([A-Za-z0-9_]+)=([^"]*)"(,?)\s*$', lines[i])
-            if not m:
-                continue
-            indent, key, old_val, comma = m.groups()
-            if key in remaining:
-                value = remaining.pop(key)
-                lines[i] = f'{indent}"{key}={esc(value)}"{comma}\n'
-                changes.append((key, old_val, value))
 
-    if remaining:
-        if po_end is None:
-            sys.exit(f"No parameter_overrides list in [{environment}.deploy.parameters] "
-                      f"to add {list(remaining)} to.")
-        indent = "  "
-        for i in range(po_start, po_end):
-            m = re.match(r'^(\s+)"', lines[i])
-            if m:
-                indent = m.group(1)
-                break
-        new_lines = [f'{indent}"{k}={esc(v)}",\n' for k, v in remaining.items()]
-        lines[po_end:po_end] = new_lines
-        for k, v in remaining.items():
-            changes.append((k, "(new)", v))
-        remaining = {}
+def update_parameter_overrides(lines: list[str], po_start, po_end, remaining: dict) -> list:
+    """Update existing "Key=Value" entries in place. Pops handled keys out of `remaining`."""
+    changes = []
+    if not remaining or po_start is None:
+        return changes
+    for i in range(po_start, po_end + 1):
+        m = re.match(r'^(\s*)"(\w+)=([^"]*)"(,?)\s*$', lines[i])
+        if not m:
+            continue
+        indent, key, old_val, comma = m.groups()
+        if key in remaining:
+            value = remaining.pop(key)
+            lines[i] = f'{indent}"{key}={esc(value)}"{comma}\n'
+            changes.append((key, old_val, value))
+    return changes
 
+
+def append_new_parameter_overrides(lines: list[str], po_start, po_end, remaining: dict, environment: str) -> list:
+    """Add any leftover keys as new parameter_overrides entries. Empties `remaining`."""
+    if not remaining:
+        return []
+    if po_end is None:
+        sys.exit(f"No parameter_overrides list in [{environment}.deploy.parameters] "
+                  f"to add {list(remaining)} to.")
+    indent = "  "
+    for i in range(po_start, po_end):
+        m = re.match(r'^(\s+)"', lines[i])
+        if m:
+            indent = m.group(1)
+            break
+    new_lines = [f'{indent}"{k}={esc(v)}",\n' for k, v in remaining.items()]
+    lines[po_end:po_end] = new_lines
+    changes = [(k, "(new)", v) for k, v in remaining.items()]
+    remaining.clear()
+    return changes
+
+
+def print_changes(changes: list) -> None:
     print()
     for key, old, new in changes:
         if old == new:
@@ -180,6 +193,8 @@ def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: b
         else:
             print(f"  {key}: {old!r} -> {new!r}")
 
+
+def write_result(config_file: Path, environment: str, lines: list[str], changes: list, dry_run: bool) -> None:
     new_content = "".join(lines)
     try:
         tomllib.loads(new_content)
@@ -196,6 +211,23 @@ def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: b
         with open(config_file, "w") as f:
             f.write(new_content)
         print(f"\nUpdated {len(changed)} value(s) in [{environment}.deploy.parameters] in {config_file}.")
+
+
+def apply_updates(config_file: Path, environment: str, updates: dict, dry_run: bool):
+    """Apply updates to samconfig.toml, editing only the matched lines."""
+    with open(config_file) as f:
+        lines = f.readlines()
+
+    section_start, section_end = find_section_bounds(lines, environment)
+    po_start, po_end = find_parameter_overrides_bounds(lines, section_start, section_end)
+
+    remaining = dict(updates)
+    changes = update_top_level_keys(lines, section_start, section_end, remaining)
+    changes += update_parameter_overrides(lines, po_start, po_end, remaining)
+    changes += append_new_parameter_overrides(lines, po_start, po_end, remaining, environment)
+
+    print_changes(changes)
+    write_result(config_file, environment, lines, changes, dry_run)
 
 
 def main():

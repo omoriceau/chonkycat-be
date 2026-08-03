@@ -72,11 +72,6 @@ Parameters:
     Default:     ""
     Description: SNS topic ARN for ops alerts (optional)
 
-  StripeSecretKeyArn:
-    Type:        String
-    Default:     ""
-    Description: ARN of the Secrets Manager secret holding STRIPE_SECRET_KEY
-
   StripeSecretKeySecretName:
     Type:    String
     Default: "chonky/dev/stripe_secret_key"
@@ -146,11 +141,14 @@ Parameters:
 # Conditions
 # ============================================================
 Conditions:
-  HasStripeSecret: !Not [!Equals [!Ref StripeSecretKeyArn, ""]]
-  # Lets the stack deploy before the storefront's Amplify pool exists yet
-  # (CustomerCognitoUserPoolId defaults to "") — POST /cart/claim just runs
-  # without the Cognito authorizer attached until it's set.
-  HasCustomerCognitoPool: !Not [!Equals [!Ref CustomerCognitoUserPoolId, ""]]
+  # HasStripeSecret and HasCustomerCognitoPool used to live here, gating
+  # the Cognito authorizer on the cart/profile routes below — removed as
+  # dead code (cfn-lint W8001). SAM doesn't support Fn::If in a per-event
+  # Auth property, so that gating was never actually possible; those
+  # routes ended up unconditional instead (see the comments near
+  # ChonkyRestApi / ClaimCart / GetUserById below), leaving both
+  # Conditions declared but unused ever since.
+  #
   # Lets the stack deploy before SES has been set up (SesDomain defaults
   # to "") — EmailServiceFunction just gets an empty EMAIL_FROM_ADDRESS
   # until setup_ses() in deploy-products.sh has run and this parameter is
@@ -166,6 +164,7 @@ Resources:
   # API Gateway (implicit)  —  auto-created by SAM for all
   # Lambda API events. No explicit stage name = root path.
   # ----------------------------------------------------------
+  # trivy:ignore:AWS-0112 — no Domain property; real domain is attached outside CFN, see deploy-products.sh
   ChonkyRestApi:
     Type: AWS::Serverless::Api
     Properties:

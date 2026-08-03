@@ -117,8 +117,16 @@ self-hosted server) before the scan will succeed.
 gh secret set SONAR_TOKEN --repo omoriceau/chonkycat-be --body "<token>"
 ```
 
-3. Self-hosted SonarQube Server only: also set `SONAR_HOST_URL` to the
-   server's URL. Skip this for SonarCloud.
+3. Self-hosted SonarQube Server only: also set the `SONAR_HOST_URL` secret
+   to the server's URL, **and** add a `SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}`
+   line to the `env:` block of the "SonarQube Scan" step in
+   `sonarqube.yml` — the two changes need to land together. That env var
+   isn't there by default: GitHub Actions turns a nonexistent secret into
+   an *empty string*, not a missing variable, and the scanner CLI fails
+   outright ("URI with undefined scheme") if `SONAR_HOST_URL` is present
+   but empty, rather than quietly falling back to SonarCloud's default
+   the way a genuinely absent variable would. Skip this whole step for
+   SonarCloud.
 
 Until `SONAR_TOKEN` is set, the workflow no-ops with a warning instead of
 failing every PR/push.

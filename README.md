@@ -150,6 +150,28 @@ aws secretsmanager create-secret \
   --region us-east-1
 ```
 
+## Local development
+
+Copy [.env.example](.env.example) to `.env.local` (already gitignored) and
+fill in real values:
+
+```bash
+cp .env.example .env.local
+```
+
+Fastest path to running something locally — set `LOCAL_MOCK_DB=true` and
+skip DynamoDB/AWS entirely; `shared/python/shared/mock_db.py` swaps in an
+in-memory table implementation. Without it, the table name variables need
+to point at real DynamoDB tables (e.g. the `dev` ones, if you have AWS
+access) and everything else — Cognito pool IDs, the Stripe key, SES
+sender address — needs real values too, or whichever code path touches
+them will fail.
+
+`.env.local` itself isn't loaded automatically by anything in this repo
+(no process reads it directly) — it's a reference for setting these as
+real environment variables in however you run a Lambda locally (`sam
+local invoke`, a debugger config, `pytest` fixtures, etc.).
+
 ## Adding a new email type
 
 1. Add a dataclass for the email's context to `lambdas/email_service/email_service/base.py`
