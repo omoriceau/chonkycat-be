@@ -8,6 +8,8 @@ Lambda: /products and /products/{productid}
   POST    /products/{productid}/image     -> upload a product image, for an existing product (see handlers/image.py)
   POST    /products/image                 -> upload a product image, for the "new product" form, keyed by sku
                                               directly since there's no product_id yet (see handlers/image.py)
+  POST    /products/inventory-check       -> check requested quantities against current stock
+                                              (see handlers/inventory.py)
 
 Environment Variables:
   - PRODUCTS_TABLE_NAME    DynamoDB table name (aws_dynamodb_table.products.name)
@@ -24,6 +26,7 @@ from db import get_db_client
 from handlers.create import handle_create_product
 from handlers.delete import handle_delete_product
 from handlers.image import handle_upload_image_for_sku, handle_upload_product_image
+from handlers.inventory import handle_check_inventory
 from handlers.read import handle_get_product, handle_list_products
 from handlers.update import handle_update_product
 from shared.cors import is_preflight, preflight_response
@@ -52,6 +55,8 @@ def lambda_handler(event: dict, context) -> dict:
     resource = event.get("resource") or event.get("path") or ""
     print(f"[DEBUG] method: {method} product_id: {product_id} resource: {resource}")
 
+    if method == "POST" and resource.endswith("/inventory-check"):
+        return handle_check_inventory(db, event)
     if method == "POST" and resource.endswith("/image") and not product_id:
         return handle_upload_image_for_sku(db, event)
     if method == "POST" and resource.endswith("/image"):

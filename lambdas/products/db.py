@@ -138,6 +138,27 @@ class DynamoDBClient:
         items = resp.get("Items", [])
         return items[0] if items else None
 
+    def get_products_by_skus(self, skus: list[str]) -> dict[str, dict]:
+        """Batch SKU lookup for the inventory-check endpoint. Not indexed
+        (same caveat as get_product_by_sku above), so this scans filtered to
+        the requested SKUs via IN. DynamoDB's IN operator caps at 100 values
+        per expression, so requests are chunked. Deliberately does NOT
+        exclude soft-deleted items — the caller decides how to treat those."""
+        skus = list(dict.fromkeys(skus))  # de-dupe, preserve order
+        found: dict[str, dict] = {}
+        for i in range(0, len(skus), 100):
+            chunk = skus[i:i + 100]
+            kwargs = {"FilterExpression": Attr("sku").is_in(chunk)}
+            while True:
+                resp = self.table.scan(**kwargs)
+                for item in resp.get("Items", []):
+                    found[item["sku"]] = item
+                last_key = resp.get("LastEvaluatedKey")
+                if not last_key:
+                    break
+                kwargs["ExclusiveStartKey"] = last_key
+        return found
+
     def update_product(self, product_id: str, updates: dict, remove_attrs: list[str]) -> dict:
         """Partial update via UpdateItem. `updates` is a dict of attribute
         name -> new value to SET. `remove_attrs` is a list of attribute
