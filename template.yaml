@@ -205,25 +205,25 @@ Resources:
   # Shared Layer  —  contains shared/db.py and any other
   # common modules used across Lambdas.
   #
-  # Directory layout expected on disk:
-  #   shared/
-  #   └── python/
-  #       ├── __init__.py
-  #       └── db.py
-  #
-  # The python/ subfolder is required — Lambda adds it to
-  # sys.path automatically, making `from shared.db import …`
-  # work in every function that includes this layer.
+  # ContentUri points at shared/ itself — the single, real copy of these
+  # modules — not a separate shared/python/ source tree. Lambda layers
+  # need a python/ prefix folder on sys.path, but that's a build-output
+  # concern, not something to hand-duplicate in git: shared/Makefile's
+  # build-SharedLayer target creates it at build time by copying shared/*.py
+  # into $(ARTIFACTS_DIR)/python/shared/. (A shared/python/ directory did
+  # exist here once, as a committed duplicate of shared/*.py that had to be
+  # kept in sync by hand — replaced by this Makefile so there's one source
+  # of truth.)
   # ----------------------------------------------------------
   SharedLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName:                !Sub chonkychonk-shared-${Environment}
-      ContentUri:               shared/python/
+      ContentUri:               shared/
       CompatibleRuntimes:       [python3.13]
       CompatibleArchitectures:  [x86_64]
     Metadata:
-      BuildMethod: python3.13
+      BuildMethod: makefile
 
   # ----------------------------------------------------------
   # EventBridge bus — created imperatively by deploy-products.sh
