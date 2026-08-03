@@ -189,6 +189,17 @@ Resources:
         Authorizers:
           CustomerCognitoAuthorizer:
             UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CustomerCognitoUserPoolId}"
+          # Admin pool (chonkychonk-admin) — gates the admin-only Users
+          # routes (GetUsers/PostUsers/DeleteUser/AdminGetUserById/
+          # AdminPutUser below). CognitoUserPoolId has no safe empty
+          # default the way CustomerCognitoUserPoolId does: UserService
+          # already raises at cold start if it's unset (see
+          # lambdas/users/service.py), and both samconfig.toml and
+          # deploy-products.sh always pass it — so, like
+          # CustomerCognitoAuthorizer above, it's safe to reference
+          # unconditionally here.
+          AdminCognitoAuthorizer:
+            UserPoolArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
 
   # ----------------------------------------------------------
   # Shared Layer  —  contains shared/db.py and any other
@@ -323,6 +334,18 @@ Resources:
           Properties:
             RestApiId: !Ref ChonkyRestApi
             Path:   /products/image
+            Method: OPTIONS
+        CheckInventory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/inventory-check
+            Method: POST
+        CheckInventoryPreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /products/inventory-check
             Method: OPTIONS
         ProductsPreflight:
           Type: Api
@@ -627,12 +650,6 @@ Resources:
               Resource:
                 - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
       Events:
-        GetUsers:
-          Type: Api
-          Properties:
-            RestApiId: !Ref ChonkyRestApi
-            Path:   /users
-            Method: GET
         # Self-service profile routes — a signed-in shopper viewing/editing
         # their own profile (see Profile.jsx). Behind the same customer
         # Cognito authorizer as POST /cart/claim (HasCustomerCognitoPool
@@ -640,16 +657,15 @@ Resources:
         # checks the caller's verified sub matches the {userId} in the
         # path, so nobody can read/edit anyone else's profile just by
         # knowing their id. GetUsers/PostUsers/DeleteUser are unrelated
-        # admin operations and stay as they were.
+        # admin operations and are gated by AdminCognitoAuthorizer instead
+        # (see below).
         #
         # The admin panel does NOT use these — it can't: its tokens come
         # from the chonkychonk-admin pool, not this customer one, so
         # they'd be rejected by CustomerCognitoAuthorizer before even
         # reaching the self-sub check. It uses AdminGetUserById/AdminPutUser
         # below instead (same {userId} shape, no self-only restriction,
-        # under the general admin Cognito authorizer attached externally
-        # via attach-cognito-authorizer.sh — same as GetUsers/PostUsers/
-        # DeleteUser).
+        # under AdminCognitoAuthorizer).
         GetUserById:
           Type: Api
           Properties:
@@ -664,12 +680,27 @@ Resources:
             # practice (see deploy-products.sh defaults), so this is safe.
             Auth:
               Authorizer: CustomerCognitoAuthorizer
+        # Admin-only — lists every user, including email/phone PII. Must
+        # never be reachable without AdminCognitoAuthorizer (see the
+        # AdminCognitoAuthorizer comment on ChonkyRestApi above for why this
+        # is declared explicitly here rather than left to attach out of
+        # band).
+        GetUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /users
+            Method: GET
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         PostUsers:
           Type: Api
           Properties:
             RestApiId: !Ref ChonkyRestApi
             Path:   /users
             Method: POST
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         PutUser:
           Type: Api
           Properties:
@@ -690,23 +721,27 @@ Resources:
             RestApiId: !Ref ChonkyRestApi
             Path:   /users/{userId}
             Method: DELETE
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         # Admin equivalents of GetUserById/PutUser — see the comment on
-        # GetUserById above. No explicit Auth block, same as GetUsers/
-        # PostUsers/DeleteUser: attach-cognito-authorizer.sh attaches the
-        # admin (chonkychonk-admin pool) authorizer to these by default,
-        # since they're not in its public-route exclude list.
+        # GetUserById above. Explicit AdminCognitoAuthorizer, same as
+        # GetUsers/PostUsers/DeleteUser.
         AdminGetUserById:
           Type: Api
           Properties:
             RestApiId: !Ref ChonkyRestApi
             Path:   /admin/users/{userId}
             Method: GET
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         AdminPutUser:
           Type: Api
           Properties:
             RestApiId: !Ref ChonkyRestApi
             Path:   /admin/users/{userId}
             Method: PUT
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         AdminUserByIdPreflight:
           Type: Api
           Properties:
