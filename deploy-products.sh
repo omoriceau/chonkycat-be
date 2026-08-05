@@ -52,6 +52,13 @@ Options:
   --customer-cognito-client-id <id>          App client id for the pool above.
                                              Also settable via
                                              CUSTOMER_COGNITO_APP_CLIENT_ID.
+  --amplify-app-id <id>                      chonky-cat-fe's Amplify app id
+                                             (e.g. d1k0utfil8j1iy — see `aws
+                                             amplify list-apps`), NOT a full
+                                             URL. Lets shared/cors.py allow
+                                             https://<branch>.<id>.amplifyapp.com
+                                             origins outside dev. Also
+                                             settable via AMPLIFY_APP_ID.
   -h, --help                                Show this help and exit
 
 Environment variables (SES/Cloudflare):
@@ -65,6 +72,9 @@ Environment variables (Cognito):
   ADMIN_COGNITO_USER_POOL_ID       Same as --admin-cognito-pool-id.
   CUSTOMER_COGNITO_USER_POOL_ID    Same as --customer-cognito-pool-id.
   CUSTOMER_COGNITO_APP_CLIENT_ID   Same as --customer-cognito-client-id.
+
+Environment variables (CORS):
+  AMPLIFY_APP_ID    Same as --amplify-app-id.
 
 Examples:
   $0
@@ -89,6 +99,10 @@ SES_DOMAIN="${SES_DOMAIN:-}"
 ADMIN_COGNITO_USER_POOL_ID="${ADMIN_COGNITO_USER_POOL_ID:-us-east-1_tzozLyJBF}"
 CUSTOMER_COGNITO_USER_POOL_ID="${CUSTOMER_COGNITO_USER_POOL_ID:-us-east-1_RN8iM0OaC}"
 CUSTOMER_COGNITO_APP_CLIENT_ID="${CUSTOMER_COGNITO_APP_CLIENT_ID:-607ej6ubfsn7o6q131f60f4kfc}"
+# chonky-cat-fe's Amplify app id — see `aws amplify list-apps`. Defaulted
+# since it's a long-lived resource, same reasoning as the admin Cognito
+# pool above; double-check it if the app is ever torn down/recreated.
+AMPLIFY_APP_ID="${AMPLIFY_APP_ID:-d1k0utfil8j1iy}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -153,6 +167,15 @@ while [[ $# -gt 0 ]]; do
     --customer-cognito-client-id)
       [ $# -ge 2 ] || die "$1 requires a value."
       CUSTOMER_COGNITO_APP_CLIENT_ID="$2"
+      shift 2
+      ;;
+    --amplify-app-id=*)
+      AMPLIFY_APP_ID="${1#*=}"
+      shift
+      ;;
+    --amplify-app-id)
+      [ $# -ge 2 ] || die "$1 requires a value."
+      AMPLIFY_APP_ID="$2"
       shift 2
       ;;
     -h|--help)
@@ -475,6 +498,7 @@ PARAM_OVERRIDES=(
   "ParameterKey=CognitoUserPoolId,ParameterValue=$ADMIN_COGNITO_USER_POOL_ID"
   "ParameterKey=CustomerCognitoUserPoolId,ParameterValue=$CUSTOMER_COGNITO_USER_POOL_ID"
   "ParameterKey=CustomerCognitoAppClientId,ParameterValue=$CUSTOMER_COGNITO_APP_CLIENT_ID"
+  "ParameterKey=AmplifyAppId,ParameterValue=$AMPLIFY_APP_ID"
 )
 
 sam deploy \
