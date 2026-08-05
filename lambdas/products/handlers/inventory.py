@@ -1,5 +1,5 @@
 """
-POST /products/inventory-check
+POST /inventory-check
 
 The frontend submits this as an actual HTML form
 (application/x-www-form-urlencoded), not JSON: each form field's name is a
