@@ -20,6 +20,7 @@ Globals:
         STRIPE_WEBHOOK_SECRET_NAME:     !Ref StripeWebhookSecretName
         ENVIRONMENT:                    !Ref Environment
         DEV_EMAIL:                      !Ref DevEmail
+        AMPLIFY_APP_ID:                 !Ref AmplifyAppId
 
 # ============================================================
 # Parameters — set per environment via samconfig.toml
@@ -59,6 +60,19 @@ Parameters:
     Default: ""
 
   CustomerCognitoAppClientId:
+    Type:    String
+    Default: ""
+
+  # ----------------------------------------------------------
+  # chonky-cat-fe's Amplify app id (e.g. "d1k0utfil8j1iy" — see `aws
+  # amplify list-apps`), NOT a full URL. shared/cors.py reads this via the
+  # AMPLIFY_APP_ID env var above to allow browser-facing requests from
+  # https://<branch>.<id>.amplifyapp.com — the preview URL used before a
+  # branch's custom domain is wired up. Left blank by default so the stack
+  # still deploys before that's known; CORS just won't match any Amplify
+  # origin until it's set.
+  # ----------------------------------------------------------
+  AmplifyAppId:
     Type:    String
     Default: ""
 
