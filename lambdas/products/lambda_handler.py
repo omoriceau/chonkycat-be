@@ -8,7 +8,7 @@ Lambda: /products and /products/{productid}
   POST    /products/{productid}/image     -> upload a product image, for an existing product (see handlers/image.py)
   POST    /products/image                 -> upload a product image, for the "new product" form, keyed by sku
                                               directly since there's no product_id yet (see handlers/image.py)
-  POST    /products/inventory-check       -> check requested quantities against current stock
+  POST    /inventory-check                -> check requested quantities against current stock
                                               (see handlers/inventory.py)
 
 Environment Variables:

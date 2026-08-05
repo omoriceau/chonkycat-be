@@ -44,8 +44,13 @@ jobs:
             echo "::group::Coverage — $name"
             python -m venv ".venv-$name"
             ".venv-$name/bin/pip" install -q -r "${dir}requirements-dev.txt"
+            # --cov=shared alongside --cov="$dir": shared/*.py (e.g.
+            # shared/cors.py) lives outside every lambdas/*/ tree, so without
+            # this it's exercised by these tests but never measured —
+            # Sonar then sees 0% coverage on any new shared/ lines since
+            # they're absent from every lambda's coverage.xml entirely.
             ".venv-$name/bin/python" -m pytest "${dir}tests" \
-              --cov="$dir" --cov-config=.coveragerc \
+              --cov="$dir" --cov=shared --cov-config=.coveragerc \
               --cov-report=xml:"${dir}coverage.xml"
             rm -rf ".venv-$name"
             echo "::endgroup::"

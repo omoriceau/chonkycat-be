@@ -7,7 +7,13 @@ to preview URLs and localhost ports that don't fit a fixed list, so we just
 echo back whatever Origin the browser sent.
 
 Outside dev, both the apex (https://chonkycat.ca) and any subdomain
-(https://admin.chonkycat.ca, https://www.chonkycat.ca, ...) are allowed.
+(https://admin.chonkycat.ca, https://www.chonkycat.ca, ...) are allowed, plus
+branch preview URLs on the storefront's Amplify app
+(https://main.<AMPLIFY_APP_ID>.amplifyapp.com, ...) since those are used
+before a branch's custom domain is wired up. The Amplify app id is read from
+the AMPLIFY_APP_ID env var rather than hardcoded, since the app (and its id)
+gets recreated occasionally — updating the env var doesn't require rebuilding
+or redeploying this layer.
 CORS has no wildcard-subdomain syntax for Access-Control-Allow-Origin — it's
 either a literal "*" or one exact origin — so this can't be done with
 API Gateway's built-in CORS config (a single static value). Instead we match
@@ -19,7 +25,14 @@ header, which the browser treats as a CORS failure.
 import os
 import re
 
-_ALLOWED_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)*chonkycat\.ca$")
+_CHONKYCAT_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)*chonkycat\.ca$")
+
+_amplify_app_id = os.environ.get("AMPLIFY_APP_ID")
+_AMPLIFY_ORIGIN_RE = (
+    re.compile(rf"^https://[a-z0-9-]+\.{re.escape(_amplify_app_id)}\.amplifyapp\.com$")
+    if _amplify_app_id
+    else None
+)
 
 DEFAULT_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 DEFAULT_ALLOW_HEADERS = "Content-Type, Authorization, X-Guest-Id"
@@ -45,7 +58,10 @@ def resolve_allow_origin(event: dict) -> str | None:
     if os.environ.get("ENVIRONMENT", "dev") == "dev":
         return origin or "*"
 
-    if origin and _ALLOWED_ORIGIN_RE.match(origin):
+    if origin and _CHONKYCAT_ORIGIN_RE.match(origin):
+        return origin
+
+    if origin and _AMPLIFY_ORIGIN_RE and _AMPLIFY_ORIGIN_RE.match(origin):
         return origin
 
     return None
