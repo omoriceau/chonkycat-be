@@ -36,28 +36,28 @@ parameter_overrides = [
 ]
 
 # ============================================================
-# PROD (stub — neither ci-deploy.sh nor deploy-products.sh reads this
-# section; see the note below. Fill in for manual `sam deploy -g` use only.)
+# PROD
 # ============================================================
 [prod.deploy.parameters]
-stack_name        = "chonkychonk-products-prod"
+stack_name        = "chonkychonk-products-production"
 region            = "us-east-1"
 confirm_changeset = false
 capabilities      = "CAPABILITY_IAM"
-s3_bucket         = "chonkychonk-sam-artifacts-prod"
+s3_bucket         = "chonkychonk-sam-artifacts-production"
 resolve_s3        = false
 parameter_overrides = [
-  "Environment=prod",
-  "UsersTableName=chonky-users-prod",
-  "ProductsTableName=chonky-products-prod",
-  "OrdersTableName=chonky-orders-prod",
-  "PaymentsTableName=chonky-payments-prod",
-  "PromotionsTableName=chonky-promotions-prod",
+  "Environment=production",
+  "UsersTableName=chonky-users-production",
+  "ProductsTableName=chonky-products-production",
+  "OrdersTableName=chonky-orders-production",
+  "PaymentsTableName=chonky-payments-production",
+  "PromotionsTableName=chonky-promotions-production",
   "EventBusName=chonkychonk-bus",
-  "CognitoUserPoolId=TODO-prod-admin-cognito-pool-id",
-  "CustomerCognitoUserPoolId=TODO-prod-customer-cognito-pool-id",
-  "CustomerCognitoAppClientId=TODO-prod-customer-cognito-app-client-id",
-  "StripeSecretKeySecretName=chonky/prod/stripe_secret_key",
-  "StripeWebhookSecretName=chonky/prod/stripe_webhook_secret",
-  "DevEmail=TODO-prod-alert-email@example.com",
+  "CognitoUserPoolId=us-east-1_7gHA2uONa",
+  "CustomerCognitoUserPoolId=us-east-1_wjgD5YOuR",
+  "CustomerCognitoAppClientId=27p6rkkuo3gvc433n823hvspol",
+  "AmplifyAppId=d1k0utfil8j1iy",
+  "StripeSecretKeySecretName=chonky/production/stripe_secret_key",
+  "StripeWebhookSecretName=chonky/production/stripe_webhook_secret",
+  "DevEmail=omoriceau@myseneca.ca",
 ]
