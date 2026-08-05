@@ -95,15 +95,16 @@ class TestRouting:
             make_event("POST", body={"sku": "RT-8", "name": "X", "current_stock": 10}), None
         ))
 
+        import json
         event = {
             "httpMethod": "POST",
             "resource": "/inventory-check",
             "path": "/inventory-check",
-            "body": "RT-8=1",
+            "body": json.dumps([{"sku": "RT-8", "quantity": 1}]),
         }
         resp = lambda_handler.lambda_handler(event, None)
         assert resp["statusCode"] == 200
-        assert body_of(resp)["data"] == []
+        assert body_of(resp) == []
 
     def test_missing_table_env_var_returns_500(self, monkeypatch, make_event):
         import importlib
