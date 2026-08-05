@@ -29,7 +29,7 @@ Parameters:
   Environment:
     Type:    String
     Default: dev
-    AllowedValues: [dev, staging, prod]
+    AllowedValues: [dev, staging, prod, production]
 
   EventBusName:
     Type:    String
