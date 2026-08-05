@@ -339,13 +339,13 @@ Resources:
           Type: Api
           Properties:
             RestApiId: !Ref ChonkyRestApi
-            Path:   /products/inventory-check
+            Path:   /inventory-check
             Method: POST
         CheckInventoryPreflight:
           Type: Api
           Properties:
             RestApiId: !Ref ChonkyRestApi
-            Path:   /products/inventory-check
+            Path:   /inventory-check
             Method: OPTIONS
         ProductsPreflight:
           Type: Api

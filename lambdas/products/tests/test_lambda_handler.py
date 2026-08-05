@@ -97,8 +97,8 @@ class TestRouting:
 
         event = {
             "httpMethod": "POST",
-            "resource": "/products/inventory-check",
-            "path": "/products/inventory-check",
+            "resource": "/inventory-check",
+            "path": "/inventory-check",
             "body": "RT-8=1",
         }
         resp = lambda_handler.lambda_handler(event, None)
