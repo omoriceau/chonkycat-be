@@ -728,6 +728,7 @@ class OrderService:
             "tax_amount": str(o.tax_amount),
             "shipping_amount": str(o.shipping_amount),
             "total_amount": str(o.total_amount),
+            "customer_email": o.customer_email,
             "customer_notes": o.customer_notes,
             "connection_id": o.connection_id,
             "shipping_name": o.shipping.name,
