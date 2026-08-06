@@ -33,6 +33,7 @@ order. If the original trigger did anything more elaborate than a plain
 decrement, that behavior needs to be ported in here too.
 """
 
+import logging
 import os
 from decimal import Decimal
 
@@ -41,7 +42,23 @@ from boto3.dynamodb.conditions import Attr, Key
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
+logger = logging.getLogger(__name__)
+
 _serializer = TypeSerializer()
+
+
+def _log_transaction_cancellation(e: ClientError, context: str) -> None:
+    """
+    TransactWriteItems failures only carry per-item detail (which write was
+    rejected and why) in response['CancellationReasons'] — str(e) just
+    lists the bare codes, e.g. "[ValidationError, None, None]", which isn't
+    enough to tell which item or attribute was invalid.
+    """
+    reasons = e.response.get("CancellationReasons")
+    if reasons:
+        logger.error("%s: %s | CancellationReasons=%s", context, e, reasons)
+    else:
+        logger.error("%s: %s", context, e)
 
 
 def _to_dynamo(item: dict) -> dict:
@@ -296,12 +313,9 @@ class DynamoDBClient:
             self._client.transact_write_items(TransactItems=transact_items)
         except ClientError as e:
             if e.response["Error"]["Code"] == "TransactionCanceledException":
-                # Order already exists or other conflict
-                import logging
-                logging.error(f"Transaction failed: {e}")
-            else:
-                raise
-        
+                _log_transaction_cancellation(e, "create_order_transaction failed")
+            raise
+
         # Now decrement stock non-transactionally (risk: partial decrements if Lambda fails,
         # but products table will self-correct via the periodic stock sync job)
         self.decrement_stock(stock_decrements)
@@ -404,11 +418,8 @@ class DynamoDBClient:
             self._client.transact_write_items(TransactItems=transact_items)
         except ClientError as e:
             if e.response["Error"]["Code"] == "TransactionCanceledException":
-                # Log the cancellation but don't fail the update
-                import logging
-                logging.error(f"Update transaction cancelled: {e}")
-            else:
-                raise
+                _log_transaction_cancellation(e, "update_order_transaction failed")
+            raise
 
     # ------------------------------------------------------------------
     # Products
