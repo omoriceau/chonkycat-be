@@ -34,13 +34,25 @@ jobs:
         run: sam validate --lint
 
   # ============================================================
-  # Deploy to dev on every push to master
+  # Deploy to dev on every push to master — but only once dev infra
+  # actually exists (DynamoDB tables / Cognito pools etc.). Gated
+  # behind the vars.DEV_ENABLED repo variable, same pattern as
+  # deploy-prod below, so an unprovisioned dev environment doesn't
+  # turn every push to master red and bury a real prod failure
+  # under a dev one:
+  #
+  #   repo Settings → Secrets and variables → Actions → Variables
+  #   → New repository variable → name DEV_ENABLED, value true
+  #
+  # Run deploy-products.sh manually, once, to provision dev's infra
+  # first — ci-deploy.sh only verifies tables/resources exist, it
+  # never creates them.
   # ============================================================
   deploy-dev:
     name: Deploy → Dev
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push' && vars.DEV_ENABLED == 'true'
     environment: dev
 
     steps:

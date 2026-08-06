@@ -97,7 +97,17 @@ class DynamoDBClient:
 
         region = os.environ.get("AWS_REGION")
         self._resource = boto3.resource("dynamodb", region_name=region)
-        self._client = self._resource.meta.client  # low-level client for transactions
+        # A plain client, NOT self._resource.meta.client: the resource
+        # registers a before-parameter-build hook on its shared client that
+        # auto-serializes any 'AttributeValue'-shaped field on every call
+        # made through it, resource-level or not. create_order_transaction /
+        # update_order_transaction below pre-serialize Items themselves
+        # (via _to_dynamo) for TransactWriteItems, which the low-level API
+        # requires in raw {"S": ...} form — reusing the resource's client
+        # would run that hook too and double-serialize every value (e.g.
+        # order_id: {"S": "x"} -> {"M": {"S": {"S": "x"}}}), which DynamoDB
+        # then rejects as a key-type mismatch.
+        self._client = boto3.client("dynamodb", region_name=region)
 
         self.orders_table = self._resource.Table(self.orders_table_name)
         self.products_table = self._resource.Table(self.products_table_name)
