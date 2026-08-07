@@ -299,9 +299,11 @@ def _handle_delete_user(event: dict) -> dict:
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
 
+    logger.info("Delete user requested | user_id=%s", user_id)
     try:
         success = _get_service().delete_user(user_id)
         if not success:
+            logger.warning("Delete user failed | user_id=%s", user_id)
             return err("User not found", status=404)
         return ok({"message": "User deleted successfully", "user_id": user_id})
     except Exception:
