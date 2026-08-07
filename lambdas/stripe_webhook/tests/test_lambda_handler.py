@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import time
+from decimal import Decimal
 from unittest.mock import MagicMock
 
 from tests.conftest import TEST_WEBHOOK_SECRET
@@ -40,6 +41,77 @@ def _patch_secret_and_events(monkeypatch):
     monkeypatch.setattr(lambda_handler, "get_secret", lambda name: TEST_WEBHOOK_SECRET)
     monkeypatch.setattr(lambda_handler, "_events", MagicMock())
     return lambda_handler
+
+
+class TestCentsToAmount:
+    def test_converts_cents_to_decimal_dollars(self):
+        import lambda_handler
+        assert lambda_handler._cents_to_amount(9376) == Decimal("93.76")
+
+    def test_rounds_to_two_decimal_places(self):
+        import lambda_handler
+        assert lambda_handler._cents_to_amount(100) == Decimal("1.00")
+
+    def test_zero_cents_returns_zero(self):
+        import lambda_handler
+        assert lambda_handler._cents_to_amount(0) == Decimal("0.00")
+
+
+class TestOrderEmailFields:
+    def test_returns_full_detail_for_existing_order(self, dynamodb_tables, orders_table, monkeypatch):
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ORDER", "status": "pending",
+            "customer_email": "shopper@example.com",
+            "customer_notes": "Leave at the side door",
+            "subtotal": "19.98", "tax_amount": "2.60", "shipping_amount": "10.00",
+            "shipping_name": "Test Guest", "shipping_address1": "1 Test St",
+            "shipping_city": "Toronto", "shipping_province": "ON",
+            "shipping_postal_code": "M5V 2H1", "shipping_country": "Canada",
+            "applied_promotions": [{"code": "WELCOME10", "discount_amount": "2.00"}],
+        })
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ITEM#0000", "name_snapshot": "Test Kibble",
+            "quantity": 2, "unit_price": "9.99", "line_total": "19.98",
+        })
+
+        import db as db_module
+        fields = lambda_handler._order_email_fields(db_module.get_db_client(), "o1")
+
+        assert fields["customer_email"] == "shopper@example.com"
+        assert fields["customer_notes"] == "Leave at the side door"
+        assert fields["subtotal"] == "19.98"
+        assert fields["tax"] == "2.60"
+        assert fields["shipping_fee"] == "10.00"
+        assert fields["discount"] == "2.00"
+        assert fields["promotion_code"] == "WELCOME10"
+        assert fields["shipping_address"] == "1 Test St, Toronto, ON, M5V 2H1, Canada"
+        assert fields["items"] == [
+            {"name": "Test Kibble", "quantity": 2, "unit_price": "9.99", "line_total": "19.98"}
+        ]
+
+    def test_returns_empty_dict_when_order_not_found(self, dynamodb_tables, orders_table, monkeypatch):
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        import db as db_module
+        assert lambda_handler._order_email_fields(db_module.get_db_client(), "missing") == {}
+
+    def test_no_discount_or_promo_when_none_applied(self, dynamodb_tables, orders_table, monkeypatch):
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ORDER", "status": "pending",
+            "customer_email": "shopper@example.com",
+            "subtotal": "9.99", "tax_amount": "1.30", "shipping_amount": "10.00",
+            "shipping_name": "Test Guest", "shipping_address1": "1 Test St",
+            "shipping_city": "Toronto", "shipping_province": "ON",
+            "shipping_postal_code": "M5V 2H1", "shipping_country": "Canada",
+        })
+
+        import db as db_module
+        fields = lambda_handler._order_email_fields(db_module.get_db_client(), "o1")
+
+        assert fields["discount"] == "0"
+        assert fields["promotion_code"] is None
+        assert fields["customer_notes"] is None
 
 
 class TestSignatureVerification:
@@ -104,6 +176,38 @@ class TestPaymentIntentSucceeded:
         assert resp["statusCode"] == 200
         assert orders_table.get_item(Key={"order_id": "o1", "sk": "ORDER"})["Item"]["status"] == "completed"
 
+    def test_emitted_event_carries_full_email_detail(self, dynamodb_tables, orders_table, monkeypatch):
+        """The confirmation email is built entirely from this event's detail
+        (email_service never touches DynamoDB itself) — regression test for
+        the order/item enrichment added alongside moving the email trigger
+        from order-creation to payment-success."""
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ORDER", "status": "pending",
+            "customer_email": "shopper@example.com",
+            "shipping_name": "Test Guest", "shipping_address1": "1 Test St",
+            "shipping_city": "Toronto", "shipping_province": "ON",
+            "shipping_postal_code": "M5V 2H1", "shipping_country": "Canada",
+            "subtotal": "24.99", "tax_amount": "3.25", "shipping_amount": "0",
+        })
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ITEM#0000", "name_snapshot": "Salmon Crisps",
+            "quantity": 1, "unit_price": "24.99", "line_total": "24.99",
+        })
+
+        request = _make_request(_webhook_event("payment_intent.succeeded", "o1"))
+        lambda_handler.lambda_handler(request, None)
+
+        entry = lambda_handler._events.put_events.call_args.kwargs["Entries"][0]
+        detail = json.loads(entry["Detail"])
+        assert entry["DetailType"] == "PaymentSucceeded"
+        assert detail["customer_email"] == "shopper@example.com"
+        assert detail["amount"] == "24.99"  # 2499 cents from _webhook_event's default
+        assert detail["currency"] == "CAD"
+        assert detail["items"] == [
+            {"name": "Salmon Crisps", "quantity": 1, "unit_price": "24.99", "line_total": "24.99"}
+        ]
+
 
 class TestPaymentIntentFailed:
     def test_updates_order_and_payment(self, dynamodb_tables, orders_table, payments_table, monkeypatch):
@@ -126,6 +230,25 @@ class TestPaymentIntentFailed:
         payment = payments_table.get_item(Key={"order_id": "o1", "sk": "PAYMENT#pi_123"})["Item"]
         assert payment["status"] == "failed"
         assert payment["error_message"] == "Your card was declined."
+
+    def test_emitted_event_carries_reason_and_customer_email(self, dynamodb_tables, orders_table, monkeypatch):
+        lambda_handler = _patch_secret_and_events(monkeypatch)
+        orders_table.put_item(Item={
+            "order_id": "o1", "sk": "ORDER", "status": "pending",
+            "customer_email": "shopper@example.com",
+        })
+
+        request = _make_request(_webhook_event(
+            "payment_intent.payment_failed", "o1",
+            extra={"last_payment_error": {"message": "Your card was declined."}},
+        ))
+        lambda_handler.lambda_handler(request, None)
+
+        entry = lambda_handler._events.put_events.call_args.kwargs["Entries"][0]
+        detail = json.loads(entry["Detail"])
+        assert entry["DetailType"] == "PaymentFailed"
+        assert detail["reason"] == "Your card was declined."
+        assert detail["customer_email"] == "shopper@example.com"
 
 
 class TestUnhandledEventType:

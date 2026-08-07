@@ -32,6 +32,7 @@ import logging
 import os
 import hmac
 import hashlib
+from decimal import Decimal
 
 import boto3
 import stripe
@@ -162,6 +163,17 @@ def verify_stripe_signature(body: str, signature: str) -> dict:
 # Order + payment status updates
 # ---------------------------------------------------------------------------
 
+def _cents_to_amount(cents: int) -> Decimal:
+    """Stripe amounts are always in the smallest currency unit (cents for
+    CAD/USD) — the email templates expect a decimal dollar amount, same as
+    what orders/service.py sends elsewhere. Takes a plain int, not
+    Optional[int] — callers resolve a missing amount to 0 themselves (e.g.
+    intent.get("amount", 0)) rather than this function accepting and
+    internally guarding against None."""
+    dollars: Decimal = Decimal(cents) / Decimal(100)
+    return dollars.quantize(Decimal("0.01"))
+
+
 def update_order_status(db, order_id: str, status: str):
     """Update order status in DynamoDB."""
     logger.info("update_order_status: order_id=%s new_status=%s", order_id, status)
@@ -203,6 +215,61 @@ def emit_event(detail_type: str, detail: dict):
 # Event handlers
 # ---------------------------------------------------------------------------
 
+def _order_email_fields(db, order_id: str) -> dict:
+    """
+    Full order + item detail for the confirmation/failure email, in the
+    exact shape email_service/lambda_handler.py's handlers expect (this
+    used to be built by orders/service.py's _emit_order_created at order-
+    creation time — moved here so the email only goes out once payment
+    actually resolves, not when the order is merely placed).
+
+    Returns {} if the order can't be found — the caller still emits the
+    event with the fields it already has (order_id, amount, currency), so
+    the email handler's own "Missing required fields" check still applies
+    rather than this raising and dropping the event entirely.
+    """
+    result = db.get_order_with_children(order_id)
+    if result is None:
+        logger.warning("Order %s not found — emitting event without email detail", order_id)
+        return {}
+
+    order = result["order"]
+    items = result["items"]
+
+    shipping_address = ", ".join(filter(None, [
+        order.get("shipping_address1"),
+        order.get("shipping_address2"),
+        order.get("shipping_city"),
+        order.get("shipping_province"),
+        order.get("shipping_postal_code"),
+        order.get("shipping_country"),
+    ]))
+
+    applied_promotions = order.get("applied_promotions") or []
+    promotion = applied_promotions[0] if applied_promotions else None
+
+    return {
+        "customer_email":   order.get("customer_email"),
+        "subtotal":         str(order.get("subtotal", "0")),
+        "discount":         str(promotion["discount_amount"]) if promotion else "0",
+        "tax":              str(order.get("tax_amount", "0")),
+        "shipping_fee":     str(order.get("shipping_amount", "0")),
+        "promotion_code":   promotion["code"] if promotion else None,
+        "shipping_name":    order.get("shipping_name"),
+        "shipping_address": shipping_address,
+        "customer_notes":   order.get("customer_notes"),
+        "items": [
+            {
+                "name":       item.get("name_snapshot"),
+                "quantity":   int(item.get("quantity", 0)),
+                "unit_price": str(item.get("unit_price", "0")),
+                "line_total": str(item.get("line_total", "0")),
+            }
+            for item in items
+        ],
+    }
+
+
 def handle_payment_intent_succeeded(db, event: dict):
     """Handle payment_intent.succeeded event."""
     logger.info("handle_payment_intent_succeeded")
@@ -224,12 +291,14 @@ def handle_payment_intent_succeeded(db, event: dict):
     # Update payment record, if we have one
     update_payment_status(db, intent_id, "succeeded")
 
-    # Emit event
+    # Emit event — the confirmation email fires off this, now that payment
+    # has actually succeeded, rather than at order-creation time.
     emit_event("PaymentSucceeded", {
         "order_id": order_id,
         "stripe_intent_id": intent_id,
-        "amount": intent.get("amount"),
-        "currency": intent.get("currency"),
+        "amount": str(_cents_to_amount(intent.get("amount", 0))),
+        "currency": (intent.get("currency") or "cad").upper(),
+        **_order_email_fields(db, order_id),
     })
 
     logger.info("Payment succeeded for order_id=%s", order_id)
@@ -258,13 +327,16 @@ def handle_payment_intent_payment_failed(db, event: dict):
     # Update payment record, if we have one
     update_payment_status(db, intent_id, "failed", error_message=error_message)
 
+    order_fields = _order_email_fields(db, order_id)
+
     # Emit event
     emit_event("PaymentFailed", {
         "order_id": order_id,
         "stripe_intent_id": intent_id,
-        "error": error_message,
-        "amount": intent.get("amount"),
-        "currency": intent.get("currency"),
+        "reason": error_message,
+        "amount": str(_cents_to_amount(intent.get("amount", 0))),
+        "currency": (intent.get("currency") or "cad").upper(),
+        "customer_email": order_fields.get("customer_email"),
     })
 
     logger.info("Payment failed for order_id=%s: %s", order_id, error_message)

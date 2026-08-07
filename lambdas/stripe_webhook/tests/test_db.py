@@ -10,6 +10,34 @@ class TestUpdateOrderStatus:
         assert "updated_at" in item
 
 
+class TestGetOrderWithChildren:
+    def test_returns_order_and_items(self, db, orders_table):
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ORDER", "status": "pending", "customer_email": "a@b.com"})
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ITEM#0001", "name_snapshot": "Salmon Crisps", "quantity": 2})
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ITEM#0000", "name_snapshot": "Tuna Tube", "quantity": 1})
+
+        result = db.get_order_with_children("o1")
+
+        assert result["order"]["order_id"] == "o1"
+        assert result["order"]["customer_email"] == "a@b.com"
+        # Sorted by sk, so ITEM#0000 (Tuna Tube) comes before ITEM#0001 (Salmon Crisps)
+        assert [i["name_snapshot"] for i in result["items"]] == ["Tuna Tube", "Salmon Crisps"]
+
+    def test_returns_none_when_order_not_found(self, db, orders_table):
+        assert db.get_order_with_children("does-not-exist") is None
+
+    def test_does_not_include_other_orders_items(self, db, orders_table):
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ORDER", "status": "pending"})
+        orders_table.put_item(Item={"order_id": "o1", "sk": "ITEM#0000", "name_snapshot": "Tuna Tube"})
+        orders_table.put_item(Item={"order_id": "o2", "sk": "ORDER", "status": "pending"})
+        orders_table.put_item(Item={"order_id": "o2", "sk": "ITEM#0000", "name_snapshot": "Unrelated"})
+
+        result = db.get_order_with_children("o1")
+
+        assert len(result["items"]) == 1
+        assert result["items"][0]["name_snapshot"] == "Tuna Tube"
+
+
 class TestFindPaymentByIntent:
     def test_finds_via_provider_txn_index(self, db, payments_table):
         payments_table.put_item(Item={

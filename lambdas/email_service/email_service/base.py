@@ -37,6 +37,7 @@ class OrderConfirmationEmail:
     subtotal:         str
     tax:              str
     shipping_fee:     str
+    customer_notes:   Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -61,12 +62,12 @@ class WelcomeEmail:
 class EmailProvider(ABC):
 
     @abstractmethod
-    def send_order_confirmation(self, email: OrderConfirmationEmail) -> bool:
+    def send_order_confirmation(self, email: OrderConfirmationEmail, subject_prefix: str = "") -> bool:
         """Returns True on success. Must never raise."""
         ...
 
     @abstractmethod
-    def send_order_failure(self, email: OrderFailureEmail) -> bool:
+    def send_order_failure(self, email: OrderFailureEmail, subject_prefix: str = "") -> bool:
         """Returns True on success. Must never raise."""
         ...
 

@@ -780,8 +780,13 @@ class OrderService:
 
     def _emit_order_created(self, order_id: str, o: ResolvedOrder) -> None:
         """
-        Fires an OrderCreated event. The Payment Lambda listens on this bus
-        filtered to source=chonkychonk.orders, detail-type=OrderCreated.
+        Fires an OrderCreated event — no active EventBridge consumer today
+        (kept for observability/future use), and deliberately NOT what
+        triggers the order-confirmation email: that now fires off
+        stripe_webhook's PaymentSucceeded event instead, once payment has
+        actually succeeded, rather than here while the order is still
+        "pending" and the shopper hasn't paid yet. See
+        email_service/lambda_handler.py's module docstring.
         """
         shipping_address = ", ".join(filter(None, [
             o.shipping.address1,

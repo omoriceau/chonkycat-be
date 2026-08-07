@@ -23,6 +23,12 @@ os.environ.setdefault("PAYMENTS_TABLE_NAME", "payments-test")
 os.environ.setdefault("STRIPE_WEBHOOK_SECRET_NAME", "chonky/test/stripe_webhook_secret")
 os.environ.setdefault("EVENT_BUS_NAME", "test-bus")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# botocore's own region auto-resolution (used by lambda_handler.py's
+# module-level `boto3.client("events")`, which passes no explicit
+# region_name) checks AWS_DEFAULT_REGION, not AWS_REGION — db.py's clients
+# all pass region_name=os.environ["AWS_REGION"] explicitly so they don't
+# need this, but anything constructed without an explicit region does.
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 

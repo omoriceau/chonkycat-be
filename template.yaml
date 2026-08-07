@@ -434,10 +434,16 @@ Resources:
             Pattern:
               source:
                 - chonkychonk.orders
+                - chonkychonk.payments
                 - chonkychonk.users
               detail-type:
-                - OrderCreated
-                - OrderFailure
+                # PaymentSucceeded/PaymentFailed (from stripe_webhook) drive
+                # the order confirmation/failure emails — not OrderCreated,
+                # which fires while the order is still "pending" (before
+                # the shopper has paid). See email_service/lambda_handler.py's
+                # module docstring.
+                - PaymentSucceeded
+                - PaymentFailed
                 - LowStockDetected
                 - UserCreated
 
