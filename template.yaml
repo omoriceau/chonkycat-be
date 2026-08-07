@@ -762,6 +762,14 @@ Resources:
             Method: PUT
             Auth:
               Authorizer: AdminCognitoAuthorizer
+        AdminDeleteUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChonkyRestApi
+            Path:   /admin/users/{userId}
+            Method: DELETE
+            Auth:
+              Authorizer: AdminCognitoAuthorizer
         AdminUserByIdPreflight:
           Type: Api
           Properties:
