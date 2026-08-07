@@ -5,10 +5,20 @@ Generic EventBridge email handler for all email events.
 Handles emails triggered by various services via EventBridge.
 
 Currently supports:
-- OrderCreated (from orders service)
-- OrderFailure (from payments service)
+- PaymentSucceeded (from stripe_webhook) — order confirmation email
+- PaymentFailed (from stripe_webhook) — order failure email
 - LowStockDetected (from orders service)
 - UserCreated (from users service) — sends a welcome email
+
+Order confirmation/failure emails fire off Stripe's webhook confirming the
+charge actually succeeded or failed, not off order creation — an order is
+only "pending" at creation time, before the shopper has even paid, so
+sending a confirmation then would tell them something happened before it
+actually did. See stripe_webhook/lambda_handler.py's
+handle_payment_intent_succeeded/_failed for where these are emitted, and
+_order_email_fields() there for how the order/item detail is attached
+(this handler never touches DynamoDB itself — the payload already has
+everything it needs).
 
 Can be extended for other email types.
 
@@ -66,13 +76,15 @@ def lambda_handler(event, context):
         
         # Route based on source and detail-type
         if source == "chonkychonk.orders":
-            if detail_type == "OrderCreated":
-                return handle_order_created(detail)
-            elif detail_type == "OrderFailure":
-                return handle_order_failure(detail)
-            elif detail_type == "LowStockDetected":
+            if detail_type == "LowStockDetected":
                 logger.info("Low stock detected | products=%s", len(detail.get("products", [])))
                 return {"statusCode": 200, "body": json.dumps({"message": "Low stock event received"})}
+
+        elif source == "chonkychonk.payments":
+            if detail_type == "PaymentSucceeded":
+                return handle_payment_succeeded(detail)
+            elif detail_type == "PaymentFailed":
+                return handle_payment_failed(detail)
 
         elif source == "chonkychonk.users":
             if detail_type == "UserCreated":
@@ -86,16 +98,16 @@ def lambda_handler(event, context):
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
 
-def handle_order_created(detail: dict) -> dict:
-    """Send order confirmation email."""
-    logger.info("Handling OrderCreated event | order_id=%s", detail.get("order_id"))
-    
+def handle_payment_succeeded(detail: dict) -> dict:
+    """Send order confirmation email once payment has actually succeeded."""
+    logger.info("Handling PaymentSucceeded event | order_id=%s", detail.get("order_id"))
+
     try:
         customer_email = detail.get("customer_email")
         order_id = detail.get("order_id")
-        
+
         if not customer_email or not order_id:
-            logger.warning("Missing required fields in OrderCreated event")
+            logger.warning("Missing required fields in PaymentSucceeded event")
             return {"statusCode": 400, "body": json.dumps({"error": "Missing customer_email or order_id"})}
         
         # Get actual recipient email (may be redirected in dev mode)
@@ -115,15 +127,12 @@ def handle_order_created(detail: dict) -> dict:
             shipping_name=detail.get("shipping_name"),
             shipping_address=detail.get("shipping_address"),
             promotion_code=detail.get("promotion_code"),
+            customer_notes=detail.get("customer_notes"),
         )
-        
-        # Add subject prefix if in dev mode
-        if subject_prefix and hasattr(email, 'subject'):
-            email.subject = subject_prefix + email.subject
-        
+
         # Send via SES
         provider = DefaultEmailProviderFactory().get_provider("ses")
-        success = provider.send_order_confirmation(email)
+        success = provider.send_order_confirmation(email, subject_prefix=subject_prefix)
         
         if success:
             logger.info("Order confirmation email sent | to=%s order_id=%s original=%s", email_to, order_id, customer_email)
@@ -176,17 +185,17 @@ def handle_user_created(detail: dict) -> dict:
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
 
-def handle_order_failure(detail: dict) -> dict:
-    """Send order failure email."""
-    logger.info("Handling OrderFailure event | order_id=%s", detail.get("order_id"))
-    
+def handle_payment_failed(detail: dict) -> dict:
+    """Send order failure email once payment has actually failed."""
+    logger.info("Handling PaymentFailed event | order_id=%s", detail.get("order_id"))
+
     try:
         customer_email = detail.get("customer_email")
         order_id = detail.get("order_id")
         reason = detail.get("reason", "Unknown error")
-        
+
         if not customer_email or not order_id:
-            logger.warning("Missing required fields in OrderFailure event")
+            logger.warning("Missing required fields in PaymentFailed event")
             return {"statusCode": 400, "body": json.dumps({"error": "Missing customer_email or order_id"})}
         
         # Get actual recipient email (may be redirected in dev mode)
@@ -199,14 +208,10 @@ def handle_order_failure(detail: dict) -> dict:
             error_message=reason,
             support_email=SUPPORT_EMAIL,
         )
-        
-        # Add subject prefix if in dev mode
-        if subject_prefix and hasattr(email, 'subject'):
-            email.subject = subject_prefix + email.subject
-        
+
         # Send via SES
         provider = DefaultEmailProviderFactory().get_provider("ses")
-        success = provider.send_order_failure(email)
+        success = provider.send_order_failure(email, subject_prefix=subject_prefix)
         
         if success:
             logger.info("Order failure email sent | to=%s order_id=%s original=%s", email_to, order_id, customer_email)
