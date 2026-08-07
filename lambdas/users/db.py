@@ -26,12 +26,15 @@ Put on that lock item's user_id (attribute_not_exists), wrapped in the same
 transaction as the real write, so either both succeed or neither does.
 """
 
+import logging
 import os
 from datetime import datetime, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
+
+logger = logging.getLogger()
 
 EMAIL_LOCK_PREFIX = "EMAIL#"
 
@@ -270,6 +273,10 @@ class DynamoDBClient:
             return True
         except ClientError as e:
             if e.response["Error"]["Code"] == "TransactionCanceledException":
+                logger.error(
+                    "delete_user transaction cancelled | user_id=%s reasons=%s",
+                    user_id, e.response.get("CancellationReasons"),
+                )
                 return False
             raise
 
