@@ -23,6 +23,7 @@ import os
 
 from email_service.factory import DefaultEmailProviderFactory
 from email_service.base import EmailAddress, OrderConfirmationEmail, OrderFailureEmail, WelcomeEmail
+from email_service.ses_provider import SUPPORT_EMAIL
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -102,13 +103,13 @@ def handle_order_created(detail: dict) -> dict:
         
         # Build the email with all order details
         email = OrderConfirmationEmail(
-            to=email_to,
+            to=EmailAddress(address=email_to, name=detail.get("shipping_name")),
             order_id=order_id,
             subtotal=detail.get("subtotal"),
             discount=detail.get("discount"),
             tax=detail.get("tax"),
             shipping_fee=detail.get("shipping_fee"),
-            total=detail.get("amount"),
+            total_amount=detail.get("amount"),
             currency=detail.get("currency", "CAD"),
             items=detail.get("items", []),
             shipping_name=detail.get("shipping_name"),
@@ -193,9 +194,10 @@ def handle_order_failure(detail: dict) -> dict:
         
         # Build the email
         email = OrderFailureEmail(
-            to=email_to,
+            to=EmailAddress(address=email_to),
             order_id=order_id,
-            reason=reason,
+            error_message=reason,
+            support_email=SUPPORT_EMAIL,
         )
         
         # Add subject prefix if in dev mode
