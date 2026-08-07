@@ -13,6 +13,7 @@ Environment Variables:
 
 import logging
 import os
+from html import escape
 from textwrap import dedent
 
 import boto3
@@ -33,6 +34,17 @@ SUPPORT_EMAIL      = os.environ.get("SUPPORT_EMAIL",      FROM_ADDRESS)
 CONFIGURATION_SET  = os.environ.get("SES_CONFIGURATION_SET")
 
 
+def _short_order_id(order_id) -> str:
+    """
+    order_id is a full UUID (see orders/service.py) — customers never need
+    the whole thing, just enough to reference the order in a support
+    conversation. Matches the profile page's order history display
+    (Profile.jsx: order.order_id.slice(0, 8)), so the id a customer sees in
+    their inbox is the same one they see on the site.
+    """
+    return str(order_id)[:8]
+
+
 class SESEmailProvider(EmailProvider):
 
     def __init__(self, ses_client=None):
@@ -42,14 +54,14 @@ class SESEmailProvider(EmailProvider):
     # Public
     # ------------------------------------------------------------------
 
-    def send_order_confirmation(self, email: OrderConfirmationEmail) -> bool:
-        subject  = f"Your ChonkyChonk order #{email.order_id} is confirmed! 🐾"
+    def send_order_confirmation(self, email: OrderConfirmationEmail, subject_prefix: str = "") -> bool:
+        subject  = subject_prefix + f"Your ChonkyChonk order #{_short_order_id(email.order_id)} is confirmed! 🐾"
         html     = self._render_confirmation_html(email)
         text     = self._render_confirmation_text(email)
         return self._send(email.to.formatted(), subject, html, text)
 
-    def send_order_failure(self, email: OrderFailureEmail) -> bool:
-        subject  = f"There was a problem with your ChonkyChonk order #{email.order_id}"
+    def send_order_failure(self, email: OrderFailureEmail, subject_prefix: str = "") -> bool:
+        subject  = subject_prefix + f"There was a problem with your ChonkyChonk order #{_short_order_id(email.order_id)}"
         html     = self._render_failure_html(email)
         text     = self._render_failure_text(email)
         return self._send(email.to.formatted(), subject, html, text)
@@ -105,6 +117,12 @@ class SESEmailProvider(EmailProvider):
             f'<td style="padding:4px 0;text-align:right;color:#5a8a5a">-${e.discount} {e.currency}</td></tr>'
             if e.promotion_code else ""
         )
+        notes_block = (
+            f"""<p style="margin:0 0 24px;font-size:14px;color:#666">
+                  <strong style="color:#3a2e24">Delivery instructions:</strong> {escape(e.customer_notes)}
+                </p>"""
+            if e.customer_notes else ""
+        )
 
         return f"""
         <!DOCTYPE html>
@@ -137,6 +155,11 @@ class SESEmailProvider(EmailProvider):
                     </tr>
                     {rows}
                     {promo_row}
+                  </table>
+
+                  {notes_block}
+
+                  <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;margin-bottom:24px">
                     <tr><td colspan="2" style="padding:6px 0;color:#888">Subtotal</td>
                         <td style="padding:6px 0;text-align:right">${e.subtotal} {e.currency}</td></tr>
                     <tr><td colspan="2" style="padding:6px 0;color:#888">Tax</td>
@@ -185,7 +208,7 @@ class SESEmailProvider(EmailProvider):
                 <tr><td style="padding:32px">
                   <p style="margin:0 0 16px;font-size:16px">
                     Hi {e.to.name or "there"}, unfortunately we were unable to process payment for
-                    order <strong>#{e.order_id}</strong>.
+                    order <strong>#{_short_order_id(e.order_id)}</strong>.
                   </p>
                   <p style="margin:0 0 16px;font-size:14px;color:#888">Reason: {e.error_message}</p>
                   <p style="margin:0;font-size:14px">
@@ -261,8 +284,9 @@ class SESEmailProvider(EmailProvider):
             for item in e.items
         )
         promo_line = f"  Promo ({e.promotion_code}): -${e.discount} {e.currency}\n" if e.promotion_code else ""
+        notes_section = f"\nDelivery instructions:\n{e.customer_notes}\n" if e.customer_notes else ""
         return dedent(f"""\
-            ChonkyChonk — Order #{e.order_id} Confirmed
+            ChonkyChonk — Order #{_short_order_id(e.order_id)} Confirmed
 
             Hi {e.to.name or "there"},
 
@@ -271,7 +295,7 @@ class SESEmailProvider(EmailProvider):
 
             Items:
             {item_lines}
-
+            {notes_section}
             {promo_line}Subtotal:  ${e.subtotal} {e.currency}
             Tax:       ${e.tax} {e.currency}
             Shipping:  ${e.shipping_fee} {e.currency}
@@ -298,11 +322,11 @@ class SESEmailProvider(EmailProvider):
 
     def _render_failure_text(self, e: OrderFailureEmail) -> str:
         return dedent(f"""\
-            ChonkyChonk — Problem with Order #{e.order_id}
+            ChonkyChonk — Problem with Order #{_short_order_id(e.order_id)}
 
             Hi {e.to.name or "there"},
 
-            We were unable to process payment for order #{e.order_id}.
+            We were unable to process payment for order #{_short_order_id(e.order_id)}.
 
             Reason: {e.error_message}
 
