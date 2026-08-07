@@ -60,4 +60,5 @@ parameter_overrides = [
   "StripeSecretKeySecretName=chonky/production/stripe_secret_key",
   "StripeWebhookSecretName=chonky/production/stripe_webhook_secret",
   "DevEmail=omoriceau@myseneca.ca",
+  "SesDomain=chonkycat.ca",
 ]
