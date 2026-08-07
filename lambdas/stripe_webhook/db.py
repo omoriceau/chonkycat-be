@@ -20,6 +20,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -54,6 +55,25 @@ class DynamoDBClient:
             ExpressionAttributeNames={"#status": "status"},  # 'status' is a reserved word
             ExpressionAttributeValues={":status": status, ":now": _now_iso()},
         )
+
+    def get_order_with_children(self, order_id: str) -> dict | None:
+        """
+        ORDER record + its ITEM# children in one Query — used to build the
+        order-confirmation/failure email payload once payment resolves
+        (see lambda_handler.py's handle_payment_intent_succeeded/_failed).
+        Mirrors orders/db.py's method of the same name. Returns None if
+        there's no ORDER record for this order_id.
+        """
+        resp = self.orders_table.query(
+            KeyConditionExpression=Key("order_id").eq(order_id)
+        )
+        rows = resp.get("Items", [])
+        order = next((r for r in rows if r["sk"] == "ORDER"), None)
+        if order is None:
+            return None
+
+        items = sorted((r for r in rows if r["sk"].startswith("ITEM#")), key=lambda r: r["sk"])
+        return {"order": order, "items": items}
 
     def find_payment_by_intent(self, intent_id: str) -> dict | None:
         """Look up a payment record via the sparse ProviderTxnIndex GSI."""
