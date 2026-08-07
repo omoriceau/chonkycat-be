@@ -252,26 +252,27 @@ class DynamoDBClient:
 
     def delete_user(self, user_id: str, email: str) -> bool:
         """Delete the user item and release its email lock together."""
+        transact_items = [
+            {
+                "Delete": {
+                    "TableName": self.table_name,
+                    "Key": _to_dynamo({"user_id": user_id}),
+                    "ConditionExpression": "attribute_exists(user_id)",
+                }
+            },
+            {
+                "Delete": {
+                    "TableName": self.table_name,
+                    "Key": _to_dynamo({"user_id": _email_lock_key(email)}),
+                }
+            },
+        ]
+        logger.info("delete_user transact_items=%r", transact_items)
         try:
-            self._client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Delete": {
-                            "TableName": self.table_name,
-                            "Key": _to_dynamo({"user_id": user_id}),
-                            "ConditionExpression": "attribute_exists(user_id)",
-                        }
-                    },
-                    {
-                        "Delete": {
-                            "TableName": self.table_name,
-                            "Key": _to_dynamo({"user_id": _email_lock_key(email)}),
-                        }
-                    },
-                ]
-            )
+            self._client.transact_write_items(TransactItems=transact_items)
             return True
         except ClientError as e:
+            logger.error("delete_user ClientError | user_id=%s response=%r", user_id, e.response)
             if e.response["Error"]["Code"] == "TransactionCanceledException":
                 logger.error(
                     "delete_user transaction cancelled | user_id=%s reasons=%s",
