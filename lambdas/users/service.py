@@ -204,6 +204,7 @@ class UserService:
         """
         existing = self._db.get_user(user_id)
         if existing is None:
+            logger.warning("delete_user: no such user | user_id=%s", user_id)
             return False
 
         deleted = self._db.delete_user(user_id, email=existing["email"])
