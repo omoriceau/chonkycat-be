@@ -409,7 +409,18 @@ class DynamoDBClient:
         ]
 
         if new_item_children is not None:
+            # Item sks are assigned positionally ("ITEM#0000", "ITEM#0001", ...)
+            # both before and after an update, so old and new children almost
+            # always share sks. A single TransactWriteItems call can't carry
+            # both a Delete and a Put for the same item (DynamoDB rejects that
+            # as "multiple operations on one item"), so skip the explicit
+            # delete for any old sk that a new Put below will overwrite
+            # anyway — only genuinely stale sks (e.g. the update shrank the
+            # item count) need an explicit Delete.
+            new_sks = {child["sk"] for child in new_item_children}
             for sk in old_item_sks:
+                if sk in new_sks:
+                    continue
                 transact_items.append({
                     "Delete": {
                         "TableName": self.orders_table_name,

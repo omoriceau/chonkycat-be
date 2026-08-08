@@ -17,28 +17,17 @@ import traceback
 from common import err, ok, parse_body
 
 
-def handle_check_inventory(db, event: dict) -> dict:
-    try:
-        items = parse_body(event)
-    except ValueError:
-        return err("Invalid JSON body", status=400)
-
-    if not isinstance(items, list) or not items:
-        return err("No SKUs provided", status=400)
-
+def _requested_skus(items: list) -> dict:
+    """Builds {sku: quantity} from the request body, or raises ValueError."""
     requested = {}
     for item in items:
         if not isinstance(item, dict) or not item.get("sku"):
-            return err("Each item must have a 'sku'", status=400)
+            raise ValueError("Each item must have a 'sku'")
         requested[item["sku"]] = item.get("quantity")
+    return requested
 
-    try:
-        products_by_sku = db.get_products_by_skus(list(requested.keys()))
-    except Exception as e:
-        print(f"[ERROR] Unexpected DynamoDB error: {e}")
-        print(traceback.format_exc())
-        return err(f"Database query failed: {str(e)}", status=500)
 
+def _skus_with_insufficient_stock(requested: dict, products_by_sku: dict) -> list:
     insufficient = []
     for sku, raw_qty in requested.items():
         try:
@@ -55,4 +44,28 @@ def handle_check_inventory(db, event: dict) -> dict:
         if int(product.get("qty", 0)) < wanted:
             insufficient.append(sku)
 
-    return ok(insufficient)
+    return insufficient
+
+
+def handle_check_inventory(db, event: dict) -> dict:
+    try:
+        items = parse_body(event)
+    except ValueError:
+        return err("Invalid JSON body", status=400)
+
+    if not isinstance(items, list) or not items:
+        return err("No SKUs provided", status=400)
+
+    try:
+        requested = _requested_skus(items)
+    except ValueError as e:
+        return err(str(e), status=400)
+
+    try:
+        products_by_sku = db.get_products_by_skus(list(requested.keys()))
+    except Exception as e:
+        print(f"[ERROR] Unexpected DynamoDB error: {e}")
+        print(traceback.format_exc())
+        return err(f"Database query failed: {str(e)}", status=500)
+
+    return ok(_skus_with_insufficient_stock(requested, products_by_sku))
