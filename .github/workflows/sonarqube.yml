@@ -44,13 +44,22 @@ jobs:
             echo "::group::Coverage — $name"
             python -m venv ".venv-$name"
             ".venv-$name/bin/pip" install -q -r "${dir}requirements-dev.txt"
-            # --cov=shared alongside --cov="$dir": shared/*.py (e.g.
-            # shared/cors.py) lives outside every lambdas/*/ tree, so without
-            # this it's exercised by these tests but never measured —
-            # Sonar then sees 0% coverage on any new shared/ lines since
-            # they're absent from every lambda's coverage.xml entirely.
+            # --cov=. (repo root), not --cov="$dir" --cov=shared: when a
+            # lambda's own file shares a basename with a shared/ file (e.g.
+            # every lambda has a db.py, and so does shared/), pytest-cov
+            # computes each class's XML filename relative to whichever
+            # --cov root matched, so both collapse to the same bare
+            # "db.py" entry — coverage.py then silently keeps only one and
+            # drops the other's data entirely. Using the repo root as the
+            # sole --cov target makes every filename a full, unambiguous
+            # path (lambdas/orders/db.py vs shared/db.py) while still only
+            # reporting files this lambda's tests actually imported —
+            # coverage.py's "list unmeasured files too" pass only walks
+            # packages that were at least partially imported (e.g. shared,
+            # via `from shared.cors import ...`), so unrelated lambdas
+            # don't leak into this report.
             ".venv-$name/bin/python" -m pytest "${dir}tests" \
-              --cov="$dir" --cov=shared --cov-config=.coveragerc \
+              --cov=. --cov-config=.coveragerc \
               --cov-report=xml:"${dir}coverage.xml"
             rm -rf ".venv-$name"
             echo "::endgroup::"

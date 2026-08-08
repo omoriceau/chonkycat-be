@@ -24,6 +24,13 @@ os.environ.setdefault("USERS_TABLE_NAME", "users-test")
 os.environ.setdefault("STRIPE_INTENT_FUNCTION_ARN", "arn:aws:lambda:us-east-1:123456789012:function:stripe-intent-test")
 os.environ.setdefault("EVENT_BUS_NAME", "test-bus")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# botocore's own region auto-resolution (used by lambda_handler.py's
+# module-level `boto3.client("events")`/`boto3.client("lambda", ...)`,
+# which pass no explicit region_name) checks AWS_DEFAULT_REGION, not
+# AWS_REGION — db.py's client passes region_name=os.environ["AWS_REGION"]
+# explicitly so it doesn't need this, but anything constructed without an
+# explicit region does.
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 

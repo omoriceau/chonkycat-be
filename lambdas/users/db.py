@@ -68,7 +68,18 @@ class DynamoDBClient:
             )
         region = os.environ.get("AWS_REGION")
         self._resource = boto3.resource("dynamodb", region_name=region)
-        self._client = self._resource.meta.client  # low-level client, needed for transact_write_items
+        # A plain client, NOT self._resource.meta.client: the resource
+        # registers a before-parameter-build hook on its shared client that
+        # auto-serializes any 'AttributeValue'-shaped field on every call
+        # made through it, resource-level or not. create_user/update_user/
+        # delete_user below pre-serialize items themselves (via _to_dynamo)
+        # for transact_write_items, which the low-level API requires in raw
+        # {"S": ...} form — reusing the resource's client would run that
+        # hook too and double-serialize every value (e.g. user_id: {"S":
+        # "x"} -> {"M": {"S": {"S": "x"}}}), which DynamoDB then rejects as
+        # a key-type mismatch (surfaces as a spurious TransactionCanceled /
+        # EmailAlreadyExists, even on an empty table).
+        self._client = boto3.client("dynamodb", region_name=region)
         self.table_name = table_name
         self.table = self._resource.Table(table_name)
 
@@ -272,9 +283,9 @@ class DynamoDBClient:
             self._client.transact_write_items(TransactItems=transact_items)
             return True
         except ClientError as e:
-            logger.error("delete_user ClientError | user_id=%s response=%r", user_id, e.response)
+            logger.exception("delete_user ClientError | user_id=%s response=%r", user_id, e.response)
             if e.response["Error"]["Code"] == "TransactionCanceledException":
-                logger.error(
+                logger.exception(
                     "delete_user transaction cancelled | user_id=%s reasons=%s",
                     user_id, e.response.get("CancellationReasons"),
                 )
