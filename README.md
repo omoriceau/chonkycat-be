@@ -159,13 +159,10 @@ fill in real values:
 cp .env.example .env.local
 ```
 
-Fastest path to running something locally — set `LOCAL_MOCK_DB=true` and
-skip DynamoDB/AWS entirely; `shared/python/shared/mock_db.py` swaps in an
-in-memory table implementation. Without it, the table name variables need
-to point at real DynamoDB tables (e.g. the `dev` ones, if you have AWS
-access) and everything else — Cognito pool IDs, the Stripe key, SES
-sender address — needs real values too, or whichever code path touches
-them will fail.
+There's no local/mock DB wired up — point the table name variables at real
+DynamoDB tables (e.g. the `dev` ones, if you have AWS access), and
+everything else — Cognito pool IDs, the Stripe key, SES sender address —
+needs real values too, or whichever code path touches them will fail.
 
 `.env.local` itself isn't loaded automatically by anything in this repo
 (no process reads it directly) — it's a reference for setting these as

@@ -32,6 +32,27 @@ from handlers.update import handle_update_product
 from shared.cors import is_preflight, preflight_response
 
 
+def _route_post(db, event: dict, product_id: str | None, resource: str) -> dict:
+    if resource.endswith("/inventory-check"):
+        return handle_check_inventory(db, event)
+    if resource.endswith("/image"):
+        if product_id:
+            return handle_upload_product_image(db, product_id, event)
+        return handle_upload_image_for_sku(db, event)
+    return handle_create_product(db, event)
+
+
+def _route_get(db, product_id: str | None, event: dict) -> dict:
+    params = event.get("queryStringParameters") or {}
+    if product_id:
+        show_deleted = (params or {}).get("show_deleted")
+        include_deleted = str(show_deleted).strip().lower() in ("1", "true", "yes")
+        return handle_get_product(db, product_id, include_deleted=include_deleted)
+
+    print(f"[DEBUG] query params: {params}")
+    return handle_list_products(db, params)
+
+
 def lambda_handler(event: dict, context) -> dict:
     print(f"[DEBUG] event: {json.dumps(event, default=str)}")
 
@@ -55,26 +76,10 @@ def lambda_handler(event: dict, context) -> dict:
     resource = event.get("resource") or event.get("path") or ""
     print(f"[DEBUG] method: {method} product_id: {product_id} resource: {resource}")
 
-    if method == "POST" and resource.endswith("/inventory-check"):
-        return handle_check_inventory(db, event)
-    if method == "POST" and resource.endswith("/image") and not product_id:
-        return handle_upload_image_for_sku(db, event)
-    if method == "POST" and resource.endswith("/image"):
-        return handle_upload_product_image(db, product_id, event)
-
     if method == "POST":
-        return handle_create_product(db, event)
+        return _route_post(db, event, product_id, resource)
     if method in ("PUT", "PATCH"):
         return handle_update_product(db, event, product_id)
     if method == "DELETE":
         return handle_delete_product(db, product_id)
-
-    if product_id:
-        params = event.get("queryStringParameters") or {}
-        show_deleted = (params or {}).get("show_deleted")
-        include_deleted = str(show_deleted).strip().lower() in ("1", "true", "yes")
-        return handle_get_product(db, product_id, include_deleted=include_deleted)
-
-    params = event.get("queryStringParameters") or {}
-    print(f"[DEBUG] query params: {params}")
-    return handle_list_products(db, params)
+    return _route_get(db, product_id, event)

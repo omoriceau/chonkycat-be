@@ -2,8 +2,7 @@
 #
 # Runs every events/*.json fixture through `sam local invoke` against the
 # real dev DynamoDB tables (there's no local/mock DB wired up for these
-# lambdas anymore since the DynamoDB migration - see shared/mock_db.py,
-# which is stale leftover from the RDS days and isn't used by any lambda).
+# lambdas anymore since the DynamoDB migration).
 #
 # Usage:
 #   ./test-events.sh              # build + run every mapped event

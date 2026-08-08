@@ -60,6 +60,11 @@ from shared.cors import build_cors_headers, is_preflight, preflight_response
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def _log_safe(value: str) -> str:
+    """Strip CR/LF from user-controlled input before it goes into a log line, to prevent log forging."""
+    return value.replace("\r", "").replace("\n", "")
+
 # Module-level service — reused across warm invocations
 # Lazy-initialized to avoid runtime crash if DB connection fails on cold start
 _service = None
@@ -299,11 +304,11 @@ def _handle_delete_user(event: dict) -> dict:
     except (KeyError, TypeError, ValueError):
         return err("Invalid userId in path", status=400)
 
-    logger.info("Delete user requested | user_id=%s", user_id)
+    logger.info("Delete user requested | user_id=%s", _log_safe(user_id))
     try:
         success = _get_service().delete_user(user_id)
         if not success:
-            logger.warning("Delete user failed | user_id=%s", user_id)
+            logger.warning("Delete user failed | user_id=%s", _log_safe(user_id))
             return err("User not found", status=404)
         return ok({"message": "User deleted successfully", "user_id": user_id})
     except Exception:

@@ -37,7 +37,8 @@ not something to automate.
 
 `.github/workflows/sonarqube.yml` runs a SonarCloud scan on the same
 triggers. Before scanning, it loops over `lambdas/*/` and, for any lambda
-with a `requirements-dev.txt` (currently just `products`), installs that
+with a `requirements-dev.txt` (currently `products`, `stripe_webhook`,
+`email_service`, `orders`, `payments_api`, and `users`), installs that
 lambda's dev deps into a throwaway venv and runs its `tests/` with
 `pytest-cov`, writing `lambdas/<name>/coverage.xml`. Each lambda's suite
 runs as its own subprocess — running two lambdas' `tests/` packages in one
@@ -47,7 +48,23 @@ needs the repo root on `sys.path` for `shared` imports to resolve.
 `sonar-project.properties`' `sonar.python.coverage.reportPaths` picks up
 `lambdas/*/coverage.xml` via wildcard, so a lambda gets coverage the moment
 it gains a `requirements-dev.txt` — no other wiring needed. Lambdas without
-one are still scanned statically but show no coverage numbers.
+one (currently just `stripe_intent`, which has no `tests/` yet) are still
+scanned statically but show no coverage numbers.
+
+The coverage command is `pytest ... --cov=. --cov-config=.coveragerc`, run
+from the repo root — not `--cov=<lambda dir> --cov=shared`. Two separate
+`--cov` roots make pytest-cov compute each file's XML path relative to
+whichever root matched, so a lambda's own `db.py` and `shared/db.py` both
+collapse to the bare filename `db.py`; coverage.py then silently keeps
+only one class entry and drops the other's data entirely (observed:
+`shared/db.py`'s all-zero coverage was clobbering every lambda's own,
+usually much-better-covered, `db.py`). Using the repo root as the sole
+`--cov` target makes every path fully qualified and unambiguous
+(`lambdas/orders/db.py` vs `shared/db.py`) while still only reporting
+files that lambda's own tests actually imported — coverage.py's
+"list unmeasured files too" pass only walks packages that were at least
+partially imported (e.g. `shared`, via `from shared.cors import ...`), so
+unrelated lambdas don't leak into another lambda's report.
 
 ## Setup
 

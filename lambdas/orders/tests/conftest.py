@@ -33,11 +33,18 @@ os.environ.setdefault("EVENT_BUS_NAME", "test-bus")
 os.environ.setdefault("CUSTOMER_COGNITO_USER_POOL_ID", "")
 os.environ.setdefault("CUSTOMER_COGNITO_APP_CLIENT_ID", "")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# botocore's own region auto-resolution (used by service.py's
+# `boto3.client("events")`, which passes no explicit region_name) checks
+# AWS_DEFAULT_REGION, not AWS_REGION — db.py's clients all pass
+# region_name=os.environ["AWS_REGION"] explicitly so they don't need this,
+# but anything constructed without an explicit region does.
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 
 ORDERS_TABLE_NAME = "orders-test"
 PRODUCTS_TABLE_NAME = "products-test"
+PROMOTIONS_TABLE_NAME = "promotions-test"
 
 
 @pytest.fixture
@@ -88,10 +95,17 @@ def dynamodb_tables():
             AttributeDefinitions=[{"AttributeName": "product_id", "AttributeType": "S"}],
             ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
         )
+        client.create_table(
+            TableName=PROMOTIONS_TABLE_NAME,
+            KeySchema=[{"AttributeName": "code", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "code", "AttributeType": "S"}],
+            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        )
         resource = boto3.resource("dynamodb", region_name="us-east-1")
         yield {
             "orders": resource.Table(ORDERS_TABLE_NAME),
             "products": resource.Table(PRODUCTS_TABLE_NAME),
+            "promotions": resource.Table(PROMOTIONS_TABLE_NAME),
         }
 
 
@@ -103,6 +117,11 @@ def orders_table(dynamodb_tables):
 @pytest.fixture
 def products_table(dynamodb_tables):
     return dynamodb_tables["products"]
+
+
+@pytest.fixture
+def promotions_table(dynamodb_tables):
+    return dynamodb_tables["promotions"]
 
 
 @pytest.fixture
@@ -140,6 +159,23 @@ def make_product():
             "low_stock_threshold": low_stock_threshold,
         })
         return product_id
+
+    return _make
+
+
+@pytest.fixture
+def make_promotion():
+    """Factory for seeding a promotion row directly via the mocked table."""
+
+    def _make(promotions_table, code="WELCOME10", discount_type="percentage",
+              discount_value="10", active=True):
+        promotions_table.put_item(Item={
+            "code": code,
+            "discount_type": discount_type,
+            "discount_value": discount_value,
+            "active": active,
+        })
+        return code
 
     return _make
 
