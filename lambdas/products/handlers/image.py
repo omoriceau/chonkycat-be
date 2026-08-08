@@ -77,9 +77,17 @@ def _parse_upload_body(event: dict) -> tuple[bytes, str] | dict:
 def _put_image(bucket: str, sku: str, image_bytes: bytes, content_type: str) -> str | dict:
     """Returns the S3 key on success, or an err() response dict on failure."""
     key = _image_key_for_sku(sku)
+    # ExpectedBucketOwner guards against a confused-deputy attack: without
+    # it, if this bucket name were ever reused by another AWS account (e.g.
+    # after deletion), put_object would silently start writing images into
+    # that account's bucket instead of failing.
+    put_kwargs = {"Bucket": bucket, "Key": key, "Body": image_bytes, "ContentType": content_type}
+    bucket_owner = os.environ.get("PRODUCT_IMAGES_BUCKET_OWNER")
+    if bucket_owner:
+        put_kwargs["ExpectedBucketOwner"] = bucket_owner
     try:
         s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION"))
-        s3.put_object(Bucket=bucket, Key=key, Body=image_bytes, ContentType=content_type)
+        s3.put_object(**put_kwargs)
     except ClientError as e:
         print(f"[ERROR] Failed to upload product image to S3: {e}")
         print(traceback.format_exc())
