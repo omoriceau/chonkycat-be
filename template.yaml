@@ -276,8 +276,9 @@ Resources:
       Description:  Product catalog CRUD - GET (public) / POST/PUT/PATCH/DELETE (authenticated) /products
       Environment:
         Variables:
-          PRODUCTS_TABLE_NAME:   !Ref ProductsTableName
-          PRODUCT_IMAGES_BUCKET: !Sub chonky-images-${Environment}
+          PRODUCTS_TABLE_NAME:         !Ref ProductsTableName
+          PRODUCT_IMAGES_BUCKET:       !Sub chonky-images-${Environment}
+          PRODUCT_IMAGES_BUCKET_OWNER: !Sub "${AWS::AccountId}"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ProductsTableName
