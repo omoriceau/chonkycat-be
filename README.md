@@ -15,10 +15,8 @@ chonky-cat-be/
 ├── ci-deploy.sh             # What CI runs: verify infra exists, sam build, sam deploy
 ├── deploy-products.sh       # Manual, interactive: provisions a new environment's infra
 │
-├── shared/python/shared/    # Lambda layer — imported as `from shared.x import y`
-│   ├── db.py                 # DynamoDB table helpers
+├── shared/                  # Lambda layer source (packaged into python/shared/ at build time)
 │   ├── cors.py                # CORS headers (dev echoes any Origin; other envs allow *.chonkycat.ca)
-│   ├── secrets.py             # Secrets Manager lookups
 │   └── events.py              # EventBridge source/detail-type constants + payload shapes
 │
 └── lambdas/
@@ -33,7 +31,10 @@ chonky-cat-be/
 ```
 
 Each `lambdas/<name>/` directory is its own independently deployable
-package with its own `requirements.txt`, `pytest.ini`, and `tests/`.
+package with its own `requirements.txt`, `pytest.ini`, and `tests/`. Each
+also keeps its own `db.py` (DynamoDB helpers) and, where needed,
+`secret_store.py` (Secrets Manager lookups) — these aren't in the shared
+layer, so table/secret access code isn't shared across Lambdas.
 
 ## API
 
@@ -47,6 +48,7 @@ All routes are on one API Gateway REST API, one stage per environment
 | POST / PUT / PATCH / DELETE | `/products[/{productid}]` | products | Admin |
 | POST | `/products/{productid}/image` | products | Admin — uploads to `chonky-images-<env>` |
 | POST | `/products/image` | products | Admin — upload by SKU |
+| POST | `/inventory-check` | products | Public — checks requested quantities against current stock |
 | GET / POST | `/orders` | orders | Admin |
 | GET / PUT / DELETE | `/orders/{orderId}` | orders | Admin |
 | GET | `/users/orders` | orders | Customer self-service (bearer token) |
@@ -56,7 +58,7 @@ All routes are on one API Gateway REST API, one stage per environment
 | POST | `/cart/claim` | orders | Requires customer Cognito auth |
 | GET / POST / DELETE | `/users`, `/users/{userId}` | users | Admin |
 | GET / PUT | `/users/{userId}` | users | Customer self-service — caller must own the `{userId}` |
-| GET / PUT | `/admin/users/{userId}` | users | Admin equivalent of the self-service routes |
+| GET / PUT / DELETE | `/admin/users/{userId}` | users | Admin equivalent of the self-service routes |
 | POST | `/payments` | payments_api | Creates an order's Stripe PaymentIntent |
 | POST | `/webhook` | stripe_webhook | Stripe calls this directly (signature-verified, not Cognito) |
 
@@ -103,6 +105,7 @@ Set on every Lambda via `template.yaml`'s `Globals`:
 | `STRIPE_WEBHOOK_SECRET_NAME` | Secrets Manager name for the Stripe webhook signing secret |
 | `ENVIRONMENT` | `dev` / `staging` / `prod` |
 | `DEV_EMAIL` | Recipient for SES sandbox-mode test sends |
+| `AMPLIFY_APP_ID` | Amplify app id; `shared/cors.py` uses it to allow `https://main.<id>.amplifyapp.com` as an origin |
 
 Per-function additions:
 
@@ -177,6 +180,15 @@ local invoke`, a debugger config, `pytest` fixtures, etc.).
 4. Add a handler branch in `lambdas/email_service/lambda_handler.py` for the new `detail-type`
 5. If the event isn't already covered, add its `detail-type` to `EmailServiceFunction`'s
    `OrderEmailEvent` pattern in `template.yaml`
+
+## Testing
+
+| Doc | Covers |
+|-----|--------|
+| [TESTING.md](TESTING.md) | Local/unit testing for all Lambda functions and endpoints |
+| [TESTING_AWS.md](TESTING_AWS.md) | Exercising deployed Lambdas and API Gateway endpoints on AWS |
+| [TESTING_AWS_UI.md](TESTING_AWS_UI.md) | Copy-paste-ready values for testing via the AWS Console |
+| [TESTING_EMAILS.md](TESTING_EMAILS.md) | Testing email sending against SES Sandbox Mode |
 
 ## CI/CD
 

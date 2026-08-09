@@ -19,10 +19,18 @@ set -euo pipefail
 #      have. PR-validation runs don't set `environment:` and never call
 #      configure-aws-credentials, so they don't need either role at all.
 #   3. Permissions on that role covering what deploy-products.sh + `sam
-#      deploy` touch: CloudFormation, Lambda, API Gateway, IAM
-#      (CreateRole/PassRole/Put*Policy — required for SAM's
-#      CAPABILITY_IAM), EventBridge, the SAM artifacts S3 bucket, and
-#      DynamoDB DescribeTable (the script only verifies tables exist).
+#      deploy` touch: CloudFormation, Lambda, API Gateway, EventBridge (all
+#      via a single customer-managed policy, chonky-cat-be-deploy-services-
+#      scoped, shared by both the dev and prod roles and scoped to this
+#      app's own resources rather than the broad AWS-managed FullAccess
+#      policies this used to attach), plus IAM (CreateRole/PassRole/
+#      Put*Policy — required for SAM's CAPABILITY_IAM), the SAM artifacts S3
+#      bucket, and DynamoDB DescribeTable (the script only verifies tables
+#      exist) via a separate inline policy. The CloudFormation statement
+#      also needs an explicit grant on the AWS::Serverless-2016-10-31
+#      transform's own pseudo-resource ARN (arn:...:aws:transform/...) —
+#      distinct from the stack ARN — or CreateChangeSet fails outright on
+#      any template using `Transform:`.
 #
 # Usage:
 #   ./setup-github-actions-oidc.sh              # creates/updates the dev role
@@ -139,17 +147,153 @@ ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output
 # attach-role-policy / put-role-policy are both idempotent — safe to run
 # every time, no existence check needed.
 # ==============================================================================
-log "Attaching managed policies..."
+log "Ensuring shared least-privilege policy 'chonky-cat-be-deploy-services-scoped' is up to date..."
 
-for POLICY_ARN in \
-    "arn:aws:iam::aws:policy/AWSCloudFormationFullAccess" \
-    "arn:aws:iam::aws:policy/AWSLambda_FullAccess" \
-    "arn:aws:iam::aws:policy/AmazonAPIGatewayAdministrator" \
-    "arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess"
-do
-    aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
-    log "  attached: $POLICY_ARN"
-done
+# One customer-managed policy shared by both the dev and prod roles (resource
+# patterns below use ${AWS::AccountId}-style wildcards that match either
+# environment's stack/function names, e.g. chonkychonk-products-dev and
+# chonkychonk-products-production both match stack/chonkychonk-products-*/*)
+# — this replaced the old AWSCloudFormationFullAccess / AWSLambda_FullAccess /
+# AmazonAPIGatewayAdministrator / AmazonEventBridgeFullAccess managed-policy
+# attachments with something scoped to just this app's resources.
+SERVICES_POLICY_NAME="chonky-cat-be-deploy-services-scoped"
+SERVICES_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${SERVICES_POLICY_NAME}"
+
+SERVICES_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationStackDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResource",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate",
+        "cloudformation:GetTemplateSummary",
+        "cloudformation:ListStackResources",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:ListChangeSets",
+        "cloudformation:TagResource",
+        "cloudformation:ValidateTemplate"
+      ],
+      "Resource": "arn:aws:cloudformation:*:${ACCOUNT_ID}:stack/chonkychonk-products-*/*"
+    },
+    {
+      "Sid": "SamTransform",
+      "Effect": "Allow",
+      "Action": "cloudformation:CreateChangeSet",
+      "Resource": "arn:aws:cloudformation:*:aws:transform/Serverless-2016-10-31"
+    },
+    {
+      "Sid": "LambdaFunctionDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:DeleteFunction",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:PublishVersion",
+        "lambda:ListVersionsByFunction",
+        "lambda:CreateAlias",
+        "lambda:UpdateAlias",
+        "lambda:DeleteAlias",
+        "lambda:GetAlias",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListTags",
+        "lambda:PutFunctionConcurrency"
+      ],
+      "Resource": "arn:aws:lambda:*:${ACCOUNT_ID}:function:chonkychonk-*"
+    },
+    {
+      "Sid": "LambdaLayerDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:PublishLayerVersion",
+        "lambda:GetLayerVersion",
+        "lambda:DeleteLayerVersion",
+        "lambda:ListLayerVersions"
+      ],
+      "Resource": "arn:aws:lambda:*:${ACCOUNT_ID}:layer:chonkychonk-*"
+    },
+    {
+      "Sid": "EventBridgeRulesAndBus",
+      "Effect": "Allow",
+      "Action": [
+        "events:DescribeEventBus",
+        "events:PutRule",
+        "events:DescribeRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
+        "events:ListTargetsByRule",
+        "events:DeleteRule",
+        "events:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:events:*:${ACCOUNT_ID}:event-bus/chonkychonk-bus",
+        "arn:aws:events:*:${ACCOUNT_ID}:rule/chonkychonk-bus/*"
+      ]
+    },
+    {
+      "Sid": "ApiGatewayManagement",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:GET",
+        "apigateway:POST",
+        "apigateway:PUT",
+        "apigateway:PATCH",
+        "apigateway:DELETE"
+      ],
+      "Resource": [
+        "arn:aws:apigateway:*::/restapis",
+        "arn:aws:apigateway:*::/restapis/*",
+        "arn:aws:apigateway:*::/tags/*"
+      ]
+    }
+  ]
+}
+EOF
+)
+
+if aws iam get-policy --policy-arn "$SERVICES_POLICY_ARN" >/dev/null 2>&1; then
+    # A managed policy can only hold 5 versions — drop the oldest non-default
+    # one first if we're already at the cap, so create-policy-version doesn't
+    # fail on a re-run.
+    OLD_VERSIONS=$(aws iam list-policy-versions --policy-arn "$SERVICES_POLICY_ARN" \
+        --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text)
+    VERSION_COUNT=$(aws iam list-policy-versions --policy-arn "$SERVICES_POLICY_ARN" \
+        --query 'length(Versions)' --output text)
+    if [[ "$VERSION_COUNT" -ge 5 ]]; then
+        OLDEST=$(aws iam list-policy-versions --policy-arn "$SERVICES_POLICY_ARN" \
+            --query 'Versions[?IsDefaultVersion==`false`] | sort_by(@, &CreateDate)[0].VersionId' --output text)
+        aws iam delete-policy-version --policy-arn "$SERVICES_POLICY_ARN" --version-id "$OLDEST"
+        log "  pruned oldest policy version ($OLDEST) to stay under the 5-version cap"
+    fi
+    aws iam create-policy-version --policy-arn "$SERVICES_POLICY_ARN" \
+        --policy-document "$SERVICES_POLICY" --set-as-default >/dev/null
+    log "  updated existing policy: $SERVICES_POLICY_ARN"
+else
+    aws iam create-policy --policy-name "$SERVICES_POLICY_NAME" \
+        --policy-document "$SERVICES_POLICY" >/dev/null
+    log "  created policy: $SERVICES_POLICY_ARN"
+fi
+
+aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$SERVICES_POLICY_ARN"
+log "  attached to $ROLE_NAME"
 
 log "Putting scoped inline policy (IAM PassRole for Lambda exec roles, SAM artifacts bucket, DynamoDB describe, Lambda logs)..."
 

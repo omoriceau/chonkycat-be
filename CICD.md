@@ -161,6 +161,11 @@ failing every PR/push.
 ## Troubleshooting
 
 If a `deploy-dev`/`deploy-prod` run hits `AccessDenied`, check the failing
-step's log for which action was denied, add it to the inline policy in
-`setup-github-actions-oidc.sh`, and re-run that script for the affected
-environment — it's idempotent.
+step's log for which action was denied, add it to the relevant policy in
+`setup-github-actions-oidc.sh` — most deploy-time permissions (CloudFormation,
+Lambda, EventBridge, API Gateway) live in the shared customer-managed policy
+`chonky-cat-be-deploy-services-scoped`; IAM PassRole, the SAM artifacts
+bucket, and DynamoDB DescribeTable live in the role's inline policy — then
+re-run that script for the affected environment. It's idempotent, and since
+the services policy is shared by both roles, running it for either
+environment updates permissions for both.
